@@ -14,8 +14,8 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
-from MPC.model import load_checkpoint
-from MPC.mujoco_simulator import MujocoDroneSim
+from model import load_checkpoint
+from mujoco_simulator import MujocoDroneSim
 
 SCRIPT_FOLDER = Path(__file__).resolve().parent
 Trained_model_path = SCRIPT_FOLDER / "MPC_Model" / "Trained_Model.pt"

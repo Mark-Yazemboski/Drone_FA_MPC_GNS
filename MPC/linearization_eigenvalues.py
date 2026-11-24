@@ -20,9 +20,9 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
-from MPC.model import Drone_Dynamics
-from MPC.MPC_controller import motor_step, prestabilizing_gains
-from MPC.visualize import set_plot_style, REPORT_WIDTH
+from model import Drone_Dynamics
+from MPC_controller import motor_step, prestabilizing_gains
+from visualize import set_plot_style, REPORT_WIDTH
 
 SCRIPT_FOLDER = Path(__file__).resolve().parent
 Trained_model_path = SCRIPT_FOLDER / "MPC_Model" / "Trained_Model.pt"

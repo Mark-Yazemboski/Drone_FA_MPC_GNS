@@ -25,8 +25,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from MPC.model import Drone_Dynamics
-from MPC.mujoco_simulator import MujocoDroneSim
+from model import Drone_Dynamics
+from mujoco_simulator import MujocoDroneSim
 
 
 SCRIPT_FOLDER = Path(__file__).resolve().parent

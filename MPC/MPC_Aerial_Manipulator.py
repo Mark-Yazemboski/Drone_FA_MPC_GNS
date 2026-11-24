@@ -1,21 +1,21 @@
 import torch
 import numpy as np
-from MPC.model import Drone_Dynamics
-from MPC.scenario_generator import Trajectory_Generator
-from MPC.utilities import to_np, calculate_contact_gate, timer
-from MPC.mujoco_simulator import MujocoDroneSim
-from MPC.visualize import animate_flight, plot_tracking
+from model import Drone_Dynamics
+from scenario_generator import Trajectory_Generator
+from utilities import to_np, calculate_contact_gate, timer
+from mujoco_simulator import MujocoDroneSim
+from visualize import animate_flight, plot_tracking
 import os
 import json
 #The MPC itself, and its weights and limits (they live with the controller; imported here for settings.json)
-from MPC.MPC_controller import mpc_control, mpc_control_batched, STATE_SIZE, INPUT_SIZE, \
+from MPC_controller import mpc_control, mpc_control_batched, STATE_SIZE, \
     MOTOR_MIN, MOTOR_MAX, MOTOR_CHANGE_LIM, INPUT_TRUST_REGION, CONTACT_MAX_DIST, ROTOR_MIN_DIST, ROLL_LIM, PITCH_LIM, \
     POSITION_WEIGHT, VELOCITY_WEIGHT, ANG_VEL_WEIGHT, NORMAL_FORCE_WEIGHT, \
     INPUT_CHANGE_WEIGHT, SLACK_WEIGHT_ROLL, SLACK_WEIGHT_PITCH, SLACK_WEIGHT_CONTACT_DISTANCE, SLACK_WEIGHT_ROTOR_DISTANCE
 import warnings
-from MPC.MPC_controller import open_event_log, set_log_step, log_event, motor_step, motor_map
-import MPC.MPC_controller as MPC_controller
-from MPC.utilities import quat_to_rot_matrix_np
+from MPC_controller import open_event_log, set_log_step, log_event, motor_step, motor_map
+import MPC_controller
+from utilities import quat_to_rot_matrix_np
 
 warnings.filterwarnings("ignore", message=".*np.chararray.*")
 
@@ -143,6 +143,14 @@ trajectory_generator.set_pad_offset(model.pad_offset.cpu().numpy())
 
 hover_input = model.calculate_hover_inputs().cpu().numpy()
 
+#Drone-specific MPC settings: one input per rotor, the motor limit from the rotors' thrust limit (if the config has
+#one), and level attitude for a fully actuated drone (it doesn't have to tilt to move or push)
+INPUT_SIZE = model.num_rotors
+if model.cfg.rotor_thrust_max:
+    MPC_controller.MOTOR_MAX = float(np.sqrt(model.cfg.rotor_thrust_max / model.cfg.k_f))
+if model.cfg.fully_actuated:
+    MPC_controller.ATTITUDE_WEIGHT = 1 / 0.05**2     # 0.05 rad (~3 deg) of roll or pitch
+
 
 #Generates the reference trajectory based on the wall and wind conditions set above, this needed to
 #happen after model because we needed the pad offset from the model
@@ -182,10 +190,10 @@ settings = dict(
                  angular_velocity=ANG_VEL_WEIGHT, normal_force=NORMAL_FORCE_WEIGHT,
                  input_tolerance=MPC_controller.INPUT_TOLERANCE, yaw_input_factor=MPC_controller.YAW_INPUT_FACTOR,
                  input_change=INPUT_CHANGE_WEIGHT, push_margin=MPC_controller.PUSH_MARGIN,
-                 motor_tau=MPC_controller.MOTOR_TAU),
+                 motor_tau=MPC_controller.MOTOR_TAU, attitude=MPC_controller.ATTITUDE_WEIGHT),
     slack_weights=dict(roll=SLACK_WEIGHT_ROLL, pitch=SLACK_WEIGHT_PITCH,
                        contact_distance=SLACK_WEIGHT_CONTACT_DISTANCE, rotor_distance=SLACK_WEIGHT_ROTOR_DISTANCE),
-    limits=dict(motor_min=MOTOR_MIN, motor_max=MOTOR_MAX, motor_change=MOTOR_CHANGE_LIM,
+    limits=dict(motor_min=MOTOR_MIN, motor_max=MPC_controller.MOTOR_MAX, motor_change=MOTOR_CHANGE_LIM,
                 trust_region=INPUT_TRUST_REGION, contact_max_dist=CONTACT_MAX_DIST,
                 rotor_min_dist=ROTOR_MIN_DIST, roll_lim=ROLL_LIM, pitch_lim=PITCH_LIM),
     wind_vector=wind_vector.tolist(), wall_normal_vector=wall_normal_vector.tolist(),
@@ -231,13 +239,14 @@ mujoco_friction_history = np.full((len(t) + 1, 3), np.nan)
 predicted_friction_history = np.full((len(t) + 1, 3), np.nan)
 
 #What the QP planned at each MPC step: the predicted outputs over the whole horizon (for the plan plots)
-planned_output_history = np.full((len(t) + 1, Horizon_length + 1, 17), np.nan, dtype=np.float32)
+planned_output_history = np.full((len(t) + 1, Horizon_length + 1, model.output_size), np.nan, dtype=np.float32)
 
 
 #Model values for the push that breaks a stuck pad loose
 model_params = dict(k_f=model.motor_kf, mass=model.mass, gravity=float(model.cfg.gravity),
                     mu=model.friction_mu, contact_radius=float(model.cfg.pad_contact_radius), dt=MPC_dt,
-                    mixer=model.thrust_mixer(), pad_offset=model.pad_offset.cpu().numpy())
+                    mixer=model.thrust_mixer(), wrench_matrix=model.wrench_matrix(),
+                    pad_offset=model.pad_offset.cpu().numpy())
 
 #The motors' squared speeds right now (thrust / k_f), tracked through the lag from the commands sent.
 #The sim starts with the motors at hover.

@@ -5,7 +5,7 @@
 from collections import deque
 import numpy as np
 import mujoco
-from MPC.utilities import vec_to_str, quat_to_rot_matrix_np, rot_matrix_to_quat_np, so3_log_np
+from utilities import vec_to_str, quat_to_rot_matrix_np, rot_matrix_to_quat_np, so3_log_np
 
 def wall_tangents(wall_normal):
     #Two directions in the wall plane: horizontal along the wall, and up the wall
@@ -92,8 +92,9 @@ class MujocoDroneSim:
 
 
     def build_xml(self):
-        #Writes the MuJoCo model: drone body (core, arms, props, rod, pad spheres), four thrust
-        #actuators with motor lag, and a wall. Masses and shapes match the training-data simulator.
+        #Writes the MuJoCo model: drone body (core, arms, props, rod, pad spheres), one thrust
+        #actuator per rotor with motor lag, and a wall. Masses and shapes come from the drone config, the same
+        #way the training-data simulator builds them.
         cfg = self.cfg
         tip = np.asarray(cfg.rod_tip, dtype=float)
         base = np.asarray(cfg.rod_base, dtype=float)
@@ -104,8 +105,8 @@ class MujocoDroneSim:
         rotors_xml = ""
         for i, (position, axis) in enumerate(zip(cfg.rotor_pos, cfg.rotor_axis)):
             rotors_xml += f"""
-      <geom name="arm{i}" type="capsule" fromto="0 0 0 {vec_to_str(position)}" size="0.008" mass="0.04" rgba=".3 .3 .3 1"/>
-      <geom name="prop{i}" type="cylinder" pos="{vec_to_str(position)}" zaxis="{vec_to_str(axis)}" size="0.06 0.005" mass="0.05" rgba=".2 .5 .9 .5"/>
+      <geom name="arm{i}" type="capsule" fromto="0 0 0 {vec_to_str(position)}" size="0.008" mass="{cfg.arm_mass}" rgba=".3 .3 .3 1"/>
+      <geom name="prop{i}" type="cylinder" pos="{vec_to_str(position)}" zaxis="{vec_to_str(axis)}" size="{cfg.prop_radius} 0.005" mass="{cfg.prop_mass}" rgba=".2 .5 .9 .5"/>
       <site name="rotor{i}" pos="{vec_to_str(position)}" zaxis="{vec_to_str(axis)}"/>"""
 
         #One small collision sphere per pad node
@@ -138,8 +139,8 @@ class MujocoDroneSim:
     </body>
     <body name="drone" pos="0 0 1">
       <freejoint/>
-      <geom name="core" type="box" size="0.06 0.06 0.025" mass="0.9" fluidshape="ellipsoid" rgba=".1 .1 .1 1"/>{rotors_xml}
-      <geom name="rod" type="capsule" fromto="{vec_to_str(base)} {vec_to_str(tip - 0.012 * rod_axis)}" size="0.006" mass="0.06"
+      <geom name="core" type="box" pos="{vec_to_str(cfg.core_pos)}" size="{vec_to_str(cfg.core_half_size)}" mass="{cfg.core_mass}" fluidshape="ellipsoid" rgba=".1 .1 .1 1"/>{rotors_xml}
+      <geom name="rod" type="capsule" fromto="{vec_to_str(base)} {vec_to_str(tip - 0.012 * rod_axis)}" size="0.006" mass="{cfg.rod_mass}"
             fluidshape="ellipsoid" rgba=".6 .6 .6 1"/>
       <geom name="sensor" type="cylinder" pos="{vec_to_str(base + 0.02 * rod_axis)}" zaxis="{vec_to_str(rod_axis)}"
             size="0.015 0.012" mass="0.05" rgba=".9 .7 .1 1"/>
@@ -262,9 +263,9 @@ class MujocoDroneSim:
         #Holds the commanded rotor speeds for `duration` seconds of sim time and returns the new state.
         #duration should be a multiple of 0.01 s (for example, one MPC step).
 
-        #Rotor speed command -> thrust command, inside the actuator range
+        #Rotor speed command -> thrust command, inside the rotors' thrust limit (the actuator range if the config has none)
         thrust_command = self.cfg.k_f * np.asarray(rotor_speeds, dtype=float) ** 2
-        self.data.ctrl[:] = np.clip(thrust_command, 0.0, 100.0)
+        self.data.ctrl[:] = np.clip(thrust_command, 0.0, self.cfg.rotor_thrust_max or 100.0)
 
         num_substeps = round(duration / self.physics_dt)
         contact_force_sum = np.zeros(3)

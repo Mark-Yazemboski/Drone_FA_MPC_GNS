@@ -28,8 +28,8 @@ import torch
 import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation
 
-from MPC.model import Drone_Dynamics
-from MPC.visualize import set_plot_style, figure_legend, save_figures, REPORT_WIDTH
+from model import Drone_Dynamics
+from visualize import set_plot_style, figure_legend, save_figures, REPORT_WIDTH
 
 
 SCRIPT_FOLDER = Path(__file__).resolve().parent

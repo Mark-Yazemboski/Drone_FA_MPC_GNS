@@ -56,6 +56,10 @@ class DroneTrainSettings:
     contact_d0: float = 0.006       # gate center: pad sphere radius (4 mm) + margin
     contact_tau: float = 0.0015
     aero_dist_max: float = 1.0      # rotor-to-wall distance is clamped/scaled by this (m)
+    # Rotor nodes also get their rotor axis (body frame, 3 numbers), so the aero GNN can
+    # tell tilted rotors apart (wall effects depend on which way a rotor points).
+    # Checkpoints saved before this option existed load with it off.
+    aero_rotor_axis_feature: bool = True
     # Hard friction cone per contact node: |F_t| <= friction_cap * F_n (smooth saturation).
     # None = off. A fixed, conservative bound (above the true mu), not the learned mu.
     friction_cap: float = None
@@ -740,7 +744,9 @@ def load_checkpoint(path, device="cpu"):
     ck = torch.load(path, map_location=device, weights_only=False)
     cfg = DroneConfig(**ck["drone_cfg"])
     known = {f.name for f in fields(DroneTrainSettings)}
-    s = DroneTrainSettings(**{k: v for k, v in ck["settings"].items() if k in known})
+    saved = dict(ck["settings"])
+    saved.setdefault("aero_rotor_axis_feature", False)          # older checkpoints were trained without it
+    s = DroneTrainSettings(**{k: v for k, v in saved.items() if k in known})
     model = DroneForceModel(cfg, s).to(device)
     model.load_state_dict(ck["model"])
     return model.eval(), cfg, s, ck

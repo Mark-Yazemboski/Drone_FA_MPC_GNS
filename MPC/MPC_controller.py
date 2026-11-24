@@ -7,11 +7,11 @@ from gurobipy import GRB
 import numpy as np
 import scipy.sparse as sp
 
-from MPC.utilities import quat_error_map, to_np, calculate_contact_gate, timer, quat_to_rot_matrix_np
+from utilities import quat_error_map, to_np, calculate_contact_gate, timer, quat_to_rot_matrix_np
 
 
 MOTOR_MIN = 0.0 #Rad/s
-MOTOR_MAX = 1000.0 #Rad/s
+MOTOR_MAX = 1000.0 #Rad/s (the run file lowers it to the drone's thrust limit when the config has one)
 MOTOR_CHANGE_LIM = 100.0 #Rad/s per control step
 
 CONTACT_MAX_DIST = 0.005 # meters
@@ -28,6 +28,9 @@ VELOCITY_WEIGHT        = 1 / 0.1**2    # 0.1 m/s
 ROD_YAW_WEIGHT         = 1 / 0.05**2    # 0.1 rad (~6 deg) sideways off the wall normal
 ROD_PITCH_WEIGHT       = 1 / 0.1**2    # 0.1 rad (~6 deg) up or down off the wall normal
 ANG_VEL_WEIGHT         = 1 / 0.5**2    # 0.5 rad/s
+#Roll and pitch toward level. 0 = off: a quad has to tilt to move and to push. A fully actuated drone doesn't, and
+#tilting it isn't wanted, so the run file turns this on for one (DroneConfig.fully_actuated).
+ATTITUDE_WEIGHT        = 0.0
 NORMAL_FORCE_WEIGHT    = 1 / 0.3**2    # 0.3 N
 #Input cost: the rotors' thrust and roll, pitch and yaw moments away from hover, each axis with its own tolerance.
 #Each axis's tolerance is set so it matches the old per-rotor cost (1/INPUT_TOLERANCE^2 per rotor): INPUT_TOLERANCE
@@ -94,9 +97,10 @@ CATCH_UP_TIME   = 0.5          # s, the wanted speed includes closing the in-pla
 MOTOR_TAU = 0.025 # s
 
 
-#Sets the state and input sizes for the MPC controller
+#Sets the state size for the MPC controller. The input is one speed per rotor (4 for the quad, 6 for the hexa); the
+#QP takes its size from the inputs it's given, and the outputs are 13 + one wall distance per rotor.
 STATE_SIZE = 19 #State: [position(3), velocity(3), quaternion(4), angular_velocity(3), velocity_km1(3), angular_velocity_km1(3)]
-INPUT_SIZE = 4 #Input: [Rotor1rpm, Rotor2rpm, Rotor3rpm, Rotor4rpm]
+OUTPUT_BASE = 13 #Outputs before the rotor distances: [F_n, roll, pitch, pad_pos(3), pad_vel(3), rod_unit(3), pad_dist]
 
 
 #The QP is small, so extra Gurobi threads don't help it
@@ -172,7 +176,7 @@ def motor_lag_factors(dt):
 
 
 def motor_step(speed_squared, command, dt):
-    #Runs the motors one step from their squared speeds now (4,), holding the command (4,).
+    #Runs the motors one step from their squared speeds now (M,), holding the command (M,).
     #Returns the effective rotor speed over the step (the model's input) and the squared speed at the end.
     end, average = motor_lag_factors(dt)
     command_squared = np.asarray(command, dtype=float) ** 2
@@ -181,8 +185,8 @@ def motor_step(speed_squared, command, dt):
 
 
 def motor_map(commands, speed_squared, dt):
-    #Effective rotor speeds over a horizon of commands (N, 4), from the motors' squared speeds now (4,),
-    #and the matrix M (N*4, N*4) with d(effective) = M d(command), linearized about these commands.
+    #Effective rotor speeds over a horizon of commands (N, M), from the motors' squared speeds now (M,),
+    #and the matrix (N*M, N*M) with d(effective) = matrix d(command), linearized about these commands.
     #M is lower triangular: a step's speed depends on its own command and the earlier ones, less the older they are.
     commands = np.asarray(commands, dtype=float)
     N, nu = commands.shape
@@ -294,15 +298,16 @@ def solve_qp(mpc, A, label="A"):
         mpc.optimize()
         log_event("numeric_retry", f"homogeneous barrier: status {mpc.Status}")
 
-#Input cost rows, one 4-row block per step: (wrench(commands) - wrench(hover)) / tolerance, linearized about the
+#Input cost rows, one block per step: (wrench(commands) - wrench(hover)) / tolerance, linearized about the
 #nominal commands. wrench = mixer @ thrusts, thrust = k_f * omega^2, so d(wrench) = mixer @ diag(2 k_f omega) d(omega).
-#mixer: (4, 4) rotor thrusts -> [thrust, roll, pitch, yaw moment] (model.thrust_mixer()).
-#Returns the matrices (one (4, 4) per step) and the nominal values (one (4,) per step).
+#mixer: rotor thrusts -> the wrench axes the rotors can change (model.thrust_mixer()): [thrust, roll, pitch, yaw]
+#(4, 4) for the quad, [Fx, Fy, Fz, roll, pitch, yaw] (6, 6) for the hexa. Yaw is the last row in both.
+#Returns the matrices (one (rows, M) per step) and the nominal values (one (rows,) per step).
 def input_wrench_rows(nominal_input, hover_input, params):
     mixer, k_f = np.asarray(params["mixer"], dtype=float), params["k_f"]
     #half the axis's wrench from INPUT_TOLERANCE on every rotor: that pattern then costs 4, like 4 rotors did before
     tolerance = np.abs(mixer) @ (k_f * hover_input * INPUT_TOLERANCE)
-    tolerance[3] *= YAW_INPUT_FACTOR
+    tolerance[-1] *= YAW_INPUT_FACTOR
     scaled_mixer = mixer / tolerance[:, None]
     matrices = [scaled_mixer * (2 * k_f * omega) for omega in nominal_input]
     values = [scaled_mixer @ (k_f * (omega ** 2 - hover_input ** 2)) for omega in nominal_input]
@@ -323,27 +328,28 @@ def squared_error(mpc, expression, size):
 #
 #Two rows per push step, both from the applied wrench (rotor thrust and moments + gravity; no contact or aero), so
 #they're linear in the deviations without the model:
-#   force:  direction . F - target,          F = T b3 + m g,  target = PUSH_MARGIN * mu * F_n
+#   force:  direction . F - target,          F = R F_rotors + m g,  target = PUSH_MARGIN * mu * F_n
 #   swing:  axis . M_pad / lever,             M_pad = R tau_rotors + (COM - pad) x F,  axis = n x direction
+#F_rotors and tau_rotors come from the wrench matrix (each rotor's thrust along its own axis, so tilted rotors work):
+#for a quad F_rotors = T b3.
 #M_pad is the moment of the applied wrench about the pad. A sideways force at the body with M_pad != 0 mostly swings
 #the body around the stuck pad (the rod is long and the yaw/pitch inertia small) instead of loading the pad; with
 #M_pad = 0 about the axis the push would swing it around, the whole force goes into the pad. For a sideways push that
 #axis is vertical (yaw), for an up/down push it's along the wall (pitch). Dividing by the lever makes it a force at the pad.
 #Derivatives: thrusts T_i = k_f omega_i^2, so dT_i = 2 k_f omega_i domega_i; the attitude error rotates R by dtheta x,
 #so for any term a . (R v) the attitude gradient is (R v) x a.
-#params: k_f, mass, gravity, mu, mixer, pad_offset from the model.
-#Returns (k, g_theta (2, 3), g_u (2, 4), constant (2,), scale) per push step.
+#params: k_f, mass, gravity, mu, wrench_matrix, pad_offset from the model.
+#Returns (k, g_theta (2, 3), g_u (2, M), constant (2,), scale) per push step.
 def stuck_push_rows(nominal_state, nominal_input, nominal_output, reference_trajectory, contact_sigma, n, params, N):
     in_plane = np.eye(3) - np.outer(n, n)
     weight = np.array([0.0, 0.0, -params["mass"] * params["gravity"]])
-    k_f, mixer = params["k_f"], np.asarray(params["mixer"], dtype=float)
+    k_f, wrench = params["k_f"], np.asarray(params["wrench_matrix"], dtype=float)
     pad_offset = np.asarray(params["pad_offset"], dtype=float)            # COM -> pad center, body frame
     lever = np.linalg.norm(pad_offset)
-    e3 = np.array([0.0, 0.0, 1.0])
 
-    #Body-frame moment about the pad per unit of each rotor's thrust: the rotor moments about the COM (mixer rows
-    #1-3), plus the thrust (along body z at the COM) taken about the pad: (COM - pad) x e3 = -pad_offset x e3
-    moment_per_thrust = mixer[1:4] - np.outer(np.cross(pad_offset, e3), np.ones(4))
+    #Body-frame moment about the pad per unit of each rotor's thrust: the rotor's moment about the COM (wrench rows
+    #3-5), plus its thrust (along its axis, at the COM) taken about the pad: (COM - pad) x a_i = -pad_offset x a_i
+    moment_per_thrust = wrench[3:6] - np.cross(pad_offset, wrench[0:3].T).T
 
     rows = []
     for k in range(N):
@@ -359,14 +365,13 @@ def stuck_push_rows(nominal_state, nominal_input, nominal_output, reference_traj
             continue
 
         R = quat_to_rot_matrix_np(nominal_state[k][6:10])
-        b3 = R[:, 2]
         omega = nominal_input[k]
         thrusts = k_f * omega ** 2
         thrust_per_speed = 2 * k_f * omega
         target = PUSH_MARGIN * params["mu"] * max(nominal_output[k][0], 0.0)
 
         #Force row: the applied force along the slide direction
-        force_theta, force_u, force_value = applied_force_row(b3, omega, direction, params)
+        force_theta, force_u, force_value = applied_force_row(R, omega, direction, params)
         force_constant = force_value - target
 
         #Swing row: moment about the pad, about the axis the push would swing the body around, as a force at the pad
@@ -391,20 +396,23 @@ def wall_axes(wall_normal_vector):
     return along_wall, np.cross(along_wall, n)
 
 
-#The applied force (thrust + gravity, no contact or aero) along a direction, and its gradients:
-#   value = direction . (T b3 + m g),   d/d(omega) = (direction . b3) 2 k_f omega,   d/d(dtheta) = T (b3 x direction)
-def applied_force_row(b3, omega, direction, params):
-    thrust = params["k_f"] * np.sum(omega ** 2)
+#The applied force (thrust + gravity, no contact or aero) along a direction, and its gradients. Each rotor pushes
+#along its own axis a_i (body frame, wrench rows 0-2), so the rotor force is F = R A_F (k_f omega^2):
+#   value = direction . (F + m g),   d/d(omega_i) = (direction . R a_i) 2 k_f omega_i,   d/d(dtheta) = F x direction
+#For a quad every a_i is body z, so F = T b3.
+def applied_force_row(R, omega, direction, params):
+    force_per_thrust = R @ np.asarray(params["wrench_matrix"], dtype=float)[0:3]       # (3, M), world frame
+    force = force_per_thrust @ (params["k_f"] * omega ** 2)
     weight = np.array([0.0, 0.0, -params["mass"] * params["gravity"]])
-    return (thrust * np.cross(b3, direction), (direction @ b3) * 2 * params["k_f"] * omega,
-            direction @ (thrust * b3 + weight))
+    return (np.cross(force, direction), (direction @ force_per_thrust) * 2 * params["k_f"] * omega,
+            direction @ (force + weight))
 
 
 #Pull-off rows at the steps where the reference says no contact, the reference pad is moving away from the wall
 #(a release, not an approach: during the approach the reference moves toward the wall or holds at the standoff, and
 #pulling off there would delay the first touch), and the plan has the pad touching (gate >= 0.5):
 #the applied force away from the wall, minus PULL_OFF_FORCE, scaled by the gate (so it fades as the pad leaves).
-#Returns (k, g_theta (3,), g_u (4,), constant, scale) per step.
+#Returns (k, g_theta (3,), g_u (M,), constant, scale) per step.
 def pull_off_rows(nominal_state, nominal_input, reference_trajectory, contact_gate, n, params, N):
     rows = []
     for k in range(N):
@@ -412,8 +420,8 @@ def pull_off_rows(nominal_state, nominal_input, reference_trajectory, contact_ga
                      and n @ reference_trajectory["pad_velocity"][k] > 0.0)
         if not releasing or contact_gate[k] < 0.5:
             continue
-        b3 = quat_to_rot_matrix_np(nominal_state[k][6:10])[:, 2]
-        g_theta, g_u, value = applied_force_row(b3, nominal_input[k], n, params)
+        R = quat_to_rot_matrix_np(nominal_state[k][6:10])
+        g_theta, g_u, value = applied_force_row(R, nominal_input[k], n, params)
         rows.append((k, g_theta, g_u, value - PULL_OFF_FORCE, contact_gate[k]))
     return rows
 
@@ -464,14 +472,15 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
 
     #Creates the decision variables for the state and input deviations
     #Sets limits for the input deviations based on the motor constraints
+    nu = nominal_input.shape[1]
     dx = mpc.addMVar((horizon_length + 1, STATE_SIZE - 1), lb=-GRB.INFINITY, name="dx")
-    du = mpc.addMVar((horizon_length, INPUT_SIZE), lb=MOTOR_MIN - nominal_input, ub=MOTOR_MAX - nominal_input, name="du")
+    du = mpc.addMVar((horizon_length, nu), lb=MOTOR_MIN - nominal_input, ub=MOTOR_MAX - nominal_input, name="du")
 
     #Motor lag: du are changes to the commands; the model sees the change in the effective rotor speed,
     #effective_du[k] = rows k of M times all the command changes
     effective_input, motor_matrix = motor_map(nominal_input[:horizon_length], motor_speed_squared, model_params["dt"])
     du_all = du.reshape(-1)
-    effective_du = [motor_matrix[k * INPUT_SIZE:(k + 1) * INPUT_SIZE] @ du_all for k in range(horizon_length)]
+    effective_du = [motor_matrix[k * nu:(k + 1) * nu] @ du_all for k in range(horizon_length)]
     slack_roll = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_roll")
     slack_pitch = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_pitch")
     slack_contact_distance = mpc.addMVar((horizon_length + 1,), lb=0, name="slack_contact_distance")
@@ -537,7 +546,7 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
         lin_pad_vel = linearized_output[6:9]
         lin_rod_unit = linearized_output[9:12]
         lin_pad_dist   = linearized_output[12]
-        lin_rotor_dist = linearized_output[13:17]
+        lin_rotor_dist = linearized_output[OUTPUT_BASE:OUTPUT_BASE + nu]
         
         #All terms related to the input, and use k = 0 .. N-1
         if k < horizon_length:
@@ -556,12 +565,12 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
            
 
             #Input cost: thrust and moments away from hover, per axis
-            cost += squared_error(mpc, wrench_matrices[k] @ du[k] + wrench_values[k], 4)
+            cost += squared_error(mpc, wrench_matrices[k] @ du[k] + wrench_values[k], len(wrench_values[k]))
             #Proximal cost: change from the nominal plan
             if PROXIMAL_WEIGHT > 0:
-                cost += PROXIMAL_WEIGHT * squared_error(mpc, du[k], 4)
+                cost += PROXIMAL_WEIGHT * squared_error(mpc, du[k], nu)
             #Input change cost
-            cost += INPUT_CHANGE_WEIGHT * squared_error(mpc, linearized_input - previous_lin_input, 4)
+            cost += INPUT_CHANGE_WEIGHT * squared_error(mpc, linearized_input - previous_lin_input, nu)
             #Normal force error cost
             #Normal force error whenever the pad is at the wall, over the whole trajectory (the reference
             #force is 0 outside the contact phase, so touching the wall when it shouldn't costs the same everywhere)
@@ -614,6 +623,9 @@ def mpc_control(A,B,C,D,nominal_state,nominal_input,nominal_output,input_vector_
             cost += ROD_PITCH_WEIGHT * squared_error(mpc, rod_pitch, 1)
             #Angular velocity error cost
             cost += ANG_VEL_WEIGHT * squared_error(mpc, angular_velocity, 3)
+            #Level attitude (fully actuated drone)
+            if ATTITUDE_WEIGHT > 0:
+                cost += ATTITUDE_WEIGHT * squared_error(mpc, linearized_output[1:3], 2)
 
             #Addes constraints related to contact with the wall
             #and how the end effector should be within a certain distance from the wall during contact
@@ -690,12 +702,13 @@ def stacked_squared_error(mpc, weights, Mx, dx, Mu, du, c):
 def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output, input_vector_current,
                         reference_trajectory, hover_thrust_values, horizon_length, d0, tau, wall_normal_vector,
                         model_params, motor_speed_squared, return_plan=False):
-    #model_params: dict(k_f, mass, gravity, mu, contact_radius, dt, mixer, pad_offset) from the model, for the stuck push,
-    #the approach speed, the motor lag (dt is the MPC step), and the input cost (mixer: rotor thrusts -> thrust and
-    #moments; pad_offset: COM -> pad center, body frame)
-    #motor_speed_squared: (4,) the rotors' squared speeds right now (from motor_step in the run file)
+    #model_params: dict(k_f, mass, gravity, mu, contact_radius, dt, mixer, wrench_matrix, pad_offset) from the model,
+    #for the stuck push, the approach speed, the motor lag (dt is the MPC step), and the input cost (mixer: rotor
+    #thrusts -> the wrench axes they can change; wrench_matrix: rotor thrusts -> full body wrench [F; M] (6, M);
+    #pad_offset: COM -> pad center, body frame)
+    #motor_speed_squared: (M,) the rotors' squared speeds right now (from motor_step in the run file)
     #nominal_input: the nominal COMMANDS; A, B, C, D are linearized at the effective (lagged) speeds they give
-    #return_plan=True also returns the planned outputs (N+1, 17): what the QP predicts the outputs
+    #return_plan=True also returns the planned outputs (N+1, 13 + M): what the QP predicts the outputs
     #will be with its chosen inputs, y_nom + C dx + D du (the nominal outputs if the solve fails)
 
     #Converts any torch tensors to numpy, since Gurobi only works with numpy
@@ -720,7 +733,7 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
 
     build_start = timer()
     N = horizon_length
-    nx, nu, ny = STATE_SIZE - 1, INPUT_SIZE, len(nominal_output[0])     # 18, 4, 17
+    nx, nu, ny = STATE_SIZE - 1, nominal_input.shape[1], len(nominal_output[0])     # 18, rotors, 13 + rotors
     n = np.asarray(wall_normal_vector, dtype=float)
 
 
@@ -905,6 +918,11 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
     cost += cost_rows(np.tile([ROD_YAW_WEIGHT, ROD_PITCH_WEIGHT], N),
                       rod_axes @ C_big[rod_rows], rod_axes @ D_big[rod_rows], rod_axes @ y_nominal[rod_rows])
 
+    #Level attitude (fully actuated drone): roll and pitch (outputs 1, 2) toward 0
+    if ATTITUDE_WEIGHT > 0:
+        rows = output_rows([1, 2], later_steps)
+        cost += cost_rows(ATTITUDE_WEIGHT * np.ones(len(rows)), C_big[rows], D_big[rows], y_nominal[rows])
+
     #Angular velocity (state entries 10:13, error-state entries 9:12)
     angular_velocity_entries = [k * nx + i for k in later_steps for i in range(9, 12)]
     select_angular_velocity = sp.csr_matrix((np.ones(3 * N), (np.arange(3 * N), angular_velocity_entries)),
@@ -931,9 +949,9 @@ def mpc_control_batched(A, B, C, D, nominal_state, nominal_input, nominal_output
         mpc.addConstr(linear(C_big[rows], D_big[rows]) - select_slack @ slack_contact_distance
                       <= CONTACT_MAX_DIST - y_nominal[rows])
 
-    #Rotors at least ROTOR_MIN_DIST from the wall (one slack per step, shared by the 4 rotors)
-    rows = output_rows([13, 14, 15, 16], later_steps)
-    each_rotor = sp.kron(sp.eye(N), np.ones((4, 1)), format="csr")
+    #Rotors at least ROTOR_MIN_DIST from the wall (one slack per step, shared by all the rotors)
+    rows = output_rows(range(OUTPUT_BASE, OUTPUT_BASE + nu), later_steps)
+    each_rotor = sp.kron(sp.eye(N), np.ones((nu, 1)), format="csr")
     mpc.addConstr(linear(C_big[rows], D_big[rows]) + each_rotor @ slack_rotor_distance
                   >= ROTOR_MIN_DIST - y_nominal[rows])
 

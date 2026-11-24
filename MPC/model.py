@@ -1,7 +1,7 @@
 #This file will act as a wrapper for the drone dynamics model. This will act
 #as an interface between the model and the MPC controller.
 #
-#Every function works on a BATCH of states: state_vector (B, 19), rotor_speeds (B, 4).
+#Every function works on a BATCH of states: state_vector (B, 19), rotor_speeds (B, M), M = number of rotors.
 #That lets the MPC linearize every step of the horizon in one call (linearize_horizon),
 #instead of one step at a time. For a single state, use a batch of 1 (state.unsqueeze(0)).
 
@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "GNS"))
 from train_drone_gns import load_checkpoint
 import torch
 import numpy as np
-from MPC.utilities import so3_log, so3_exp, quat_to_rot_matrix, rot_matrix_to_quat
+from utilities import so3_log, so3_exp, quat_to_rot_matrix, rot_matrix_to_quat
 
 
 #Matrix times vector for a batch: M (B, 3, 3), v (B, 3) -> (B, 3)
@@ -55,6 +55,9 @@ class Drone_Dynamics:
         self.rod_base_location = torch.tensor(self.cfg.rod_base,   dtype=torch.float32, device=self.device)
         self.rotor_locations   = torch.tensor(np.asarray(self.cfg.rotor_pos) - self.cfg.com_offset, dtype=torch.float32, device=self.device)
         self.spin_dirs   = np.asarray(self.cfg.spin_dir, float)
+        self.rotor_axes  = np.asarray(self.cfg.rotor_axis, float) / np.linalg.norm(self.cfg.rotor_axis, axis=1, keepdims=True)
+        self.num_rotors  = len(self.cfg.rotor_pos)
+        self.output_size = 13 + self.num_rotors                  #see outputs()
         self.motor_kf = float(self.model.params.k_f)
         self.motor_km = float(self.model.params.k_m)        
         self.friction_mu = float(torch.exp(checkpoint["phys"]["log_mu"]))     #learned friction coefficient
@@ -70,16 +73,33 @@ class Drone_Dynamics:
         self.I_body_inv = torch.linalg.inv(self.I_body)
 
 
+    def wrench_matrix(self):
+        #Rotor thrusts (M,) -> body-frame wrench about the COM [Fx, Fy, Fz, Mx, My, Mz] (6, M):
+        #each thrust acts along its rotor's axis at its hub, plus the yaw reaction -spin k_m/k_f along that axis
+        rotor_locations = self.rotor_locations.cpu().numpy()
+        moments = np.cross(rotor_locations, self.rotor_axes) \
+            - (self.spin_dirs * self.motor_km / self.motor_kf)[:, None] * self.rotor_axes
+        return np.vstack([self.rotor_axes.T, moments.T])
+
+    def mixer_rows(self):
+        #Wrench axes the rotors can change: a quad's rotors all point up, so its Fx and Fy rows are zero and drop out
+        wrench = self.wrench_matrix()
+        return np.flatnonzero(np.abs(wrench).max(axis=1) > 1e-9)
+
     def thrust_mixer(self):
-        #Rotor thrusts (4,) -> [total thrust, roll moment, pitch moment, yaw moment] about the COM, body frame
-        rotor_xs = self.rotor_locations[:, 0].cpu().numpy()
-        rotor_ys = self.rotor_locations[:, 1].cpu().numpy()
-        return np.vstack([np.ones(4), rotor_ys, -rotor_xs, -self.spin_dirs * self.motor_km / self.motor_kf])
+        #Rotor thrusts -> the wrench axes they can change, about the COM, body frame:
+        #quad (4, 4) [total thrust, roll moment, pitch moment, yaw moment]; hexa (6, 6) [Fx, Fy, Fz, Mx, My, Mz]
+        return self.wrench_matrix()[self.mixer_rows()]
 
     def calculate_hover_inputs(self):
 
-        #Solves for the individual rotor thrusts required to achieve hover.
-        T = np.linalg.solve(self.thrust_mixer(), [self.mass * self.cfg.gravity, 0.0, 0.0, 0.0])
+        #Solves for the individual rotor thrusts required to achieve hover (level, no wind).
+        hover_wrench = np.array([0.0, 0.0, self.mass * self.cfg.gravity, 0.0, 0.0, 0.0])[self.mixer_rows()]
+        mixer = self.thrust_mixer()
+        if mixer.shape[0] == mixer.shape[1]:
+            T = np.linalg.solve(mixer, hover_wrench)
+        else:
+            T = np.linalg.lstsq(mixer, hover_wrench, rcond=None)[0]       #more rotors than wrench axes: least effort
 
         #Converts the thrusts to rotor speeds using the motor's thrust coefficient.
         return torch.tensor(np.sqrt(T / self.motor_kf), dtype=torch.float32, device=self.device)
@@ -213,7 +233,7 @@ class Drone_Dynamics:
     def propagate_state(self, state_vector, rotor_speeds):
         #Propagates a batch of drone states one model time step.
         #state_vector (B, 19): [COM_position, COM_velocity, Quaternion, Angular_velocity, Previous_velocity, Previous_angular_velocity]
-        #rotor_speeds (B, 4)
+        #rotor_speeds (B, M)
         #Returns the new state vectors (B, 19), the new rotation matrices (B, 3, 3), and force info.
         B = state_vector.shape[0]
 
@@ -327,9 +347,9 @@ class Drone_Dynamics:
         p = state_vector[:, 0:3]
         R = quat_to_rot_matrix(state_vector[:, 6:10])
         pad_pts   = p.unsqueeze(1) + torch.einsum('bij,nj->bni', R, self.model.pad_rest)     # (B, 9, 3)  pad nodes
-        rotor_pts = p.unsqueeze(1) + torch.einsum('bij,nj->bni', R, self.model.rotor_pos)    # (B, 4, 3)  rotor hubs
+        rotor_pts = p.unsqueeze(1) + torch.einsum('bij,nj->bni', R, self.model.rotor_pos)    # (B, M, 3)  rotor hubs
         d_pad = ((pad_pts - self.wall_center_point) @ self.wall_normal_vector).min(dim=1).values   # (B,)
-        d_rotor = (rotor_pts - self.wall_center_point) @ self.wall_normal_vector                    # (B, 4)
+        d_rotor = (rotor_pts - self.wall_center_point) @ self.wall_normal_vector                    # (B, M)
         return d_pad, d_rotor
 
     def get_tilt(self, state_vector):
@@ -339,8 +359,8 @@ class Drone_Dynamics:
         return roll, pitch
 
     def outputs(self, state_vector, normal_force):
-        #Packs every output the MPC needs into one vector per sample (B, 17):
-        #[F_n(1), roll(1), pitch(1), pad_pos(3), pad_vel(3), rod_unit(3), min_pad_dist(1), rotor_dist(4)]
+        #Packs every output the MPC needs into one vector per sample (B, 13 + M):
+        #[F_n(1), roll(1), pitch(1), pad_pos(3), pad_vel(3), rod_unit(3), min_pad_dist(1), rotor_dist(M)]
         pad_position_global, pad_velocity_global, rod_unit_vector_global = self.get_pad_values(state_vector)
         roll, pitch = self.get_tilt(state_vector)
         pad_distance, rotor_distance = self.get_wall_distances(state_vector)
@@ -382,7 +402,7 @@ class Drone_Dynamics:
     def rollout(self, state_vector, input_sequence, MPC_dt_multiple):
         #Nominal trajectory over the horizon (no gradients). This part is sequential, since each
         #state depends on the one before it, but it's cheap (one forward pass per step).
-        #state_vector (19,), input_sequence (N, 4) -> nominal states (N + 1, 19), starting with state_vector
+        #state_vector (19,), input_sequence (N, M) -> nominal states (N + 1, 19), starting with state_vector
         with torch.no_grad():
             nominal_states = [state_vector]
             for rotor_speeds in input_sequence:
@@ -393,9 +413,9 @@ class Drone_Dynamics:
 
     def linearize_horizon(self, nominal_states, input_sequence, MPC_dt_multiple):
         #Linearizes the dynamics about EVERY step of the horizon at once.
-        #nominal_states (N, 19), input_sequence (N, 4): the nominal state and input at each step
-        #Returns A (N, 18, 18), B (N, 18, 4), C (N, 17, 18), D (N, 17, 4),
-        #the nominal next states (N, 19), and the nominal outputs (N, 17).
+        #nominal_states (N, 19), input_sequence (N, M): the nominal state and input at each step
+        #Returns A (N, 18, 18), B (N, 18, M), C (N, 13+M, 18), D (N, 13+M, M),
+        #the nominal next states (N, 19), and the nominal outputs (N, 13+M).
         N = nominal_states.shape[0]
 
         #Calculates the nominal next states and nominal outputs without any perturbations.
@@ -423,9 +443,9 @@ class Drone_Dynamics:
             return torch.cat([state_diff, output_diff], dim=-1).sum(0)
 
         #Compute the Jacobians of the function g with respect to the state and input deviations.
-        #Jx: (35, N, 18), Ju: (35, N, 4) -> reordered so the horizon step comes first
+        #Jx: (31+M, N, 18), Ju: (31+M, N, M) -> reordered so the horizon step comes first
         zeros_dx = torch.zeros(N, 18, device=self.device)
-        zeros_du = torch.zeros(N, 4, device=self.device)
+        zeros_du = torch.zeros(N, self.num_rotors, device=self.device)
         Jx, Ju = torch.autograd.functional.jacobian(g, (zeros_dx, zeros_du), vectorize=True)
         Jx = Jx.permute(1, 0, 2)
         Ju = Ju.permute(1, 0, 2)
@@ -443,7 +463,7 @@ class Drone_Dynamics:
 
     def linearize_outputs(self, state_vector):
         #Output rows only (no dynamics), for the final state of the horizon. No GNN involved.
-        #state_vector (19,) -> C (17, 18), nominal output (17,)
+        #state_vector (19,) -> C (13+M, 18), nominal output (13+M,)
         state_batch = state_vector.unsqueeze(0)
         no_force = torch.zeros(1, device=self.device)
         with torch.no_grad():

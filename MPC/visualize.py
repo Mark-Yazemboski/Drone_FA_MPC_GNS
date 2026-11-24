@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
-from MPC.utilities import quat_to_rot_matrix_np
+from utilities import quat_to_rot_matrix_np
 
 
 #Colors: actual = blue, reference = orange (dashed), model / MPC plan = green
@@ -94,9 +94,16 @@ def drone_shape(drone_cfg):
     rod_tip = np.asarray(drone_cfg.rod_tip, dtype=float) - com
     pad_radius = max(radius for radius, _ in drone_cfg.pad_rings)
 
-    #Circle outlines for the propellers (horizontal) and the pad (perpendicular to the rod)
+    #Circle outlines for the propellers (each in its own disk plane, so tilted rotors show tilted) and the pad
+    #(perpendicular to the rod)
     angles = np.linspace(0, 2 * np.pi, 24)
-    prop_circle = 0.06 * np.stack([np.cos(angles), np.sin(angles), np.zeros_like(angles)], axis=1)
+    prop_circles = []
+    for rotor, axis in zip(rotors, np.asarray(drone_cfg.rotor_axis, dtype=float)):
+        axis = axis / np.linalg.norm(axis)
+        u = np.cross(axis, [1.0, 0.0, 0.0] if abs(axis[0]) < 0.9 else [0.0, 1.0, 0.0])
+        u = u / np.linalg.norm(u)
+        v = np.cross(axis, u)
+        prop_circles.append(rotor + drone_cfg.prop_radius * (np.outer(np.cos(angles), u) + np.outer(np.sin(angles), v)))
 
     rod_axis = (rod_tip - rod_base) / np.linalg.norm(rod_tip - rod_base)
     u = np.cross(rod_axis, [0.0, 0.0, 1.0])
@@ -105,7 +112,8 @@ def drone_shape(drone_cfg):
     pad_circle = rod_tip + pad_radius * (np.outer(np.cos(angles), u) + np.outer(np.sin(angles), v))
 
     return dict(rotors=rotors, rod_base=rod_base, rod_tip=rod_tip,
-                prop_circle=prop_circle, pad_circle=pad_circle)
+                prop_circles=prop_circles, pad_circle=pad_circle,
+                radius=float(np.max(np.linalg.norm(rotors, axis=1)) + drone_cfg.prop_radius))
 
 
 def animate_flight(drone_cfg, wall_normal, wall_point, state_history, dt,
@@ -147,7 +155,7 @@ def animate_flight(drone_cfg, wall_normal, wall_point, state_history, dt,
     #Fixed, equal-scale axes around the whole flight and the wall
     all_points = np.vstack([state_history[:, 0:3], np.asarray(wall_corners)])
     center = all_points.mean(axis=0)
-    half_range = 0.5 * np.max(all_points.max(axis=0) - all_points.min(axis=0)) + 0.3
+    half_range = 0.5 * np.max(all_points.max(axis=0) - all_points.min(axis=0)) + max(0.3, shape["radius"])
     ax.set_xlim(center[0] - half_range, center[0] + half_range)
     ax.set_ylim(center[1] - half_range, center[1] + half_range)
     ax.set_zlim(center[2] - half_range, center[2] + half_range)
@@ -170,7 +178,7 @@ def animate_flight(drone_cfg, wall_normal, wall_point, state_history, dt,
         for i, rotor in enumerate(shape["rotors"]):
             hub = to_world(rotor[None, :], position, R)[0]
             arm_lines[i].set_data_3d([position[0], hub[0]], [position[1], hub[1]], [position[2], hub[2]])
-            prop = to_world(shape["prop_circle"] + rotor, position, R)
+            prop = to_world(shape["prop_circles"][i], position, R)
             prop_lines[i].set_data_3d(prop[:, 0], prop[:, 1], prop[:, 2])
 
         #Rod and pad

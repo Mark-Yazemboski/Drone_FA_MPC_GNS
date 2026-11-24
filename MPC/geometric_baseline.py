@@ -1,7 +1,9 @@
 """
 Baseline run: the geometric (Lee et al. 2010) controller flying the MPC's reference trajectory in MuJoCo.
+For a fully actuated drone (DroneConfig.fully_actuated) it flies a full-wrench controller instead that holds the
+drone level, like the MPC asks it to.
 
-Same controller as the training-data generator, without the excitation noise and gain randomization.
+Same controllers as the training-data generator, without the excitation noise and gain randomization.
 Saves MPC_runs/<name>/run_data.npz in the same format as the MPC runs (so open_loop_linearization_test.py
 can use it), plus a tracking plot.
 
@@ -13,12 +15,13 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+from scipy.optimize import lsq_linear
 
-from MPC.model import load_checkpoint
-from MPC.mujoco_simulator import MujocoDroneSim
-from MPC.scenario_generator import Trajectory_Generator
-from MPC.utilities import quat_to_rot_matrix_np
-from MPC.visualize import plot_tracking, animate_flight
+from model import load_checkpoint
+from mujoco_simulator import MujocoDroneSim
+from scenario_generator import Trajectory_Generator
+from utilities import quat_to_rot_matrix_np
+from visualize import plot_tracking, animate_flight
 
 
 SCRIPT_FOLDER = Path(__file__).resolve().parent
@@ -34,7 +37,7 @@ YAW_BANDWIDTH = 3.0                 #rad/s, slower since yaw authority is small 
 DAMPING = 0.9
 MAX_TILT = np.radians(35.0)
 
-#Rotor thrust limits as fractions of the per-rotor hover thrust (m g / 4)
+#Rotor thrust limits as fractions of the per-rotor hover thrust (m g / number of rotors)
 MIN_THRUST_FRACTION = 0.05
 MAX_THRUST_FRACTION = 2.5
 
@@ -74,12 +77,12 @@ class GeometricController:
         #Mixer: [total thrust, roll torque, pitch torque, yaw torque] = mixer @ rotor thrusts
         rotor_positions = sim.rotor_positions           #relative to the COM, body frame
         spin = np.asarray(cfg.spin_dir, dtype=float)
-        self.mixer = np.vstack([np.ones(4),
+        self.mixer = np.vstack([np.ones(len(rotor_positions)),
                                 rotor_positions[:, 1],
                                 -rotor_positions[:, 0],
                                 -spin * cfg.k_m / cfg.k_f])
 
-        hover_thrust = self.mass * self.gravity / 4
+        hover_thrust = self.mass * self.gravity / len(rotor_positions)
         self.thrust_min = MIN_THRUST_FRACTION * hover_thrust
         self.thrust_max = MAX_THRUST_FRACTION * hover_thrust
 
@@ -137,6 +140,63 @@ class GeometricController:
         return np.sqrt(rotor_thrusts / self.k_f)
 
 
+class FullyActuatedController(GeometricController):
+    #Same position and attitude loops, but the force and torque are tracked separately: the world force goes to
+    #the rotors as a body-frame force, the attitude loop holds the drone level at the heading, and the 6-D wrench
+    #is allocated to the rotors (exact when it fits the thrust limits, else bounded least squares with the
+    #torques weighted more, so attitude wins when the rotors saturate)
+
+    def __init__(self, sim, heading):
+        super().__init__(sim, heading)
+        cfg = sim.cfg
+        self.K_R = np.array([ATTITUDE_BANDWIDTH] * 3) ** 2 * np.diag(self.inertia)       #yaw has authority here
+        self.K_Omega = 2 * DAMPING * np.array([ATTITUDE_BANDWIDTH] * 3) * np.diag(self.inertia)
+
+        #Wrench matrix: [force; torque] about the COM, body frame, = wrench_matrix @ rotor thrusts
+        spin = np.asarray(cfg.spin_dir, dtype=float)
+        moments = np.cross(sim.rotor_positions, sim.rotor_axes) - (spin * cfg.k_m / cfg.k_f)[:, None] * sim.rotor_axes
+        self.wrench_matrix = np.vstack([sim.rotor_axes.T, moments.T])
+        arm = np.mean(np.linalg.norm(sim.rotor_positions, axis=1))
+        weight = self.mass * self.gravity
+        self.row_weights = np.r_[np.full(3, 1.0 / weight), np.full(3, 3.0 / (weight * arm))]
+
+        num_rotors = len(cfg.rotor_pos)
+        self.thrust_min = MIN_THRUST_FRACTION * self.mass * self.gravity / num_rotors
+        self.thrust_max = cfg.rotor_thrust_max or MAX_THRUST_FRACTION * self.mass * self.gravity / num_rotors
+        self.R_level = np.column_stack([heading, np.cross(E3, heading), E3])
+
+
+    def compute(self, state, com_reference, velocity_reference, push_force, wall_normal):
+        position = state[0:3]
+        velocity = state[3:6]
+        R = quat_to_rot_matrix_np(state[6:10])
+        body_rates = R.T @ state[10:13]
+
+        position_error = position - com_reference
+        velocity_error = velocity - velocity_reference
+        desired_force = self.mass * (-self.k_x * position_error - self.k_v * velocity_error + self.gravity * E3)
+        desired_force = desired_force - push_force * wall_normal
+
+        attitude_error = 0.5 * vee(self.R_level.T @ R - R.T @ self.R_level)
+        torque = -self.K_R * attitude_error - self.K_Omega * body_rates
+        torque = torque + np.cross(body_rates, self.inertia @ body_rates)
+        return self.allocate(np.concatenate([R.T @ desired_force, torque]))
+
+
+    def allocate(self, wrench):
+        rotor_thrusts = np.linalg.lstsq(self.wrench_matrix, wrench, rcond=None)[0]
+        if np.any(rotor_thrusts < self.thrust_min) or np.any(rotor_thrusts > self.thrust_max):
+            weights = self.row_weights[:, None]
+            rotor_thrusts = lsq_linear(weights * self.wrench_matrix, self.row_weights * wrench,
+                                       bounds=(self.thrust_min, self.thrust_max)).x
+        return np.sqrt(rotor_thrusts / self.k_f)
+
+
+    def mix(self, thrust, torque):
+        #Hover input (level): thrust straight up plus the given torques
+        return self.allocate(np.concatenate([[0.0, 0.0, thrust], torque]))
+
+
 #---------------------------------- Setup ----------------------------------------
 
 name = "Geometric_Baseline"
@@ -169,7 +229,7 @@ R_initial = quat_to_rot_matrix_np(initial_state[6:10])
 heading = np.array([R_initial[0, 0], R_initial[1, 0], 0.0])
 heading = heading / np.linalg.norm(heading)
 
-controller = GeometricController(sim, heading)
+controller = (FullyActuatedController if drone_cfg.fully_actuated else GeometricController)(sim, heading)
 
 #Level attitude at that heading, used to turn the pad reference into a COM reference
 R_heading = np.column_stack([heading, np.cross(E3, heading), E3])

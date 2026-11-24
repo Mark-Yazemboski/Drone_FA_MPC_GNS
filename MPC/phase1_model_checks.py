@@ -26,12 +26,12 @@ import torch
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-from MPC.model import Drone_Dynamics
-from MPC.mujoco_simulator import MujocoDroneSim
-import MPC.MPC_controller as MPC_controller
-from MPC.MPC_controller import motor_step
-from MPC.utilities import quat_to_rot_matrix, quat_to_rot_matrix_np
-from MPC.visualize import (set_plot_style, figure_legend, save_figures, to_wall_frame, REPORT_WIDTH,
+from model import Drone_Dynamics
+from mujoco_simulator import MujocoDroneSim
+import MPC_controller
+from MPC_controller import motor_step
+from utilities import quat_to_rot_matrix, quat_to_rot_matrix_np
+from visualize import (set_plot_style, figure_legend, save_figures, to_wall_frame, REPORT_WIDTH,
                        ACTUAL_COLOR, MODEL_COLOR)
 
 SCRIPT_FOLDER = Path(__file__).resolve().parent

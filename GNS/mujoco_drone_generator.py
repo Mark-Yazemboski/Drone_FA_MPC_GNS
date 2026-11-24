@@ -11,15 +11,20 @@ inputs. So any controller that reliably makes the contacts we want is fine.
                  push, push-and-slide) written as pad-center waypoints in the
                  wall frame, smoothed with min-jerk segments, plus a push-force
                  profile
-  controller     standard geometric (SE(3)) position + attitude controller
-                 (Lee et al. 2010) once per recorded frame (100 Hz), with a slow
-                 yaw loop. Pushing is a feedforward force into the wall on top
+  controller     quad: standard geometric (SE(3)) position + attitude
+                 controller (Lee et al. 2010) once per recorded frame (100 Hz),
+                 with a slow yaw loop. Fully actuated drone (tilted rotors): world
+                 force + body torque tracked independently, so it can hold a
+                 random roll/pitch target while it tracks the pad reference
+                 (drone_controllers.py). Pushing is a feedforward force into the wall on top
                  of position tracking, so the controller needs no force
                  measurement. The command is held for the whole frame, so the
                  rotor speeds over [t, t+1] depend only on the state at t (see
                  CAUSALITY below)
-  mixer          desired collective thrust + body torques -> 4 rotor thrusts,
-                 roll/pitch first, then as much yaw as still fits
+  mixer          quad: desired collective thrust + body torques -> 4 rotor
+                 thrusts, roll/pitch first, then as much yaw as still fits.
+                 Fully actuated: the 6-D body wrench -> rotor thrusts, exact
+                 when it fits the thrust limits, else bounded least squares
   excitation     random band-limited noise on the rotor commands, so rotor
                  speeds are not a fixed function of the state (closed-loop
                  data is otherwise biased toward the controller's own choices)
@@ -45,6 +50,7 @@ WHAT IS RECORDED (per frame, dt = timestep * substeps)
                       is exactly what the second difference sees (meta says
                       "aligned"). With high-rate ESC telemetry, hardware can
                       compute the same thing.
+  rotor_thrust        the same aligned value as thrust (N), what AM-Bench reports
   rotor_speed_cmd     commanded speed at the frame (for a motor model later)
   wind, wall_normal, wall_point, phase (commanded scenario phase)
   labels (aligned the same way, validation only):
@@ -78,7 +84,15 @@ SCENARIO SETTINGS
   top of this file. Each trajectory saves them in meta["gen_settings"], and the
   closed-loop test rebuilds its scenarios from that, so it always matches the data.
 
+FILES
+  drone_scenarios.py       reference waypoints, push profiles, attitude targets
+  drone_controllers.py     quad and fully actuated controllers, allocation
+  mujoco_drone_backend.py  MJCF, mass properties, the MuJoCo plant
+  this file                GenSettings, one trajectory, the driver, the CLI
+An AM-Bench port replaces only the backend (same plant calls).
+
 Run:  python mujoco_drone_generator.py --out data/mj_drone_wind --n 1200
+      python mujoco_drone_generator.py --out data/mj_hexa --n 1200 --drone fa_hexa
       python mujoco_drone_generator.py --out data/mj_drone_wind --n 1200 --wind-max 3   (override wind)
       python mujoco_drone_generator.py --out data/mj_drone --n 5 --verify
       python mujoco_drone_generator.py --replay data/mj_drone/3.pt   (viewer)
@@ -91,13 +105,18 @@ import json
 import math
 import os
 
+
 import mujoco
 import numpy as np
 import torch
 
-from drone_config import DroneConfig, build_drone_graph
-
-PHASES = {"free": 0, "approach": 1, "hold": 2, "slide": 3, "release": 4, "hover_near": 5}
+from drone_config import DroneConfig, PRESETS, build_drone_graph, hover_thrusts
+from drone_scenarios import (PHASES, Reference, make_scenario, wall_tangents, push_force_vector,
+                             add_attitude_targets, reference_attitude, yaw_force_cap, limit_segment_accel)
+from drone_controllers import (GeometricController, FullyActuatedController, make_controller, thrust_limits,
+                               max_hover_torque, min_hover_side_force)
+from mujoco_drone_backend import (build_xml, true_config_from_model, Crash, MujocoDronePlant, align_to_frames,
+                                  set_wall_pose, _quat2mat, _mat2quat)
 
 
 @dataclasses.dataclass
@@ -165,446 +184,64 @@ class GenSettings:
     side_load_frac: tuple = (0.3, 1.2)          # tangential push as a fraction of mu * F (>1 creeps / breaks away)
     side_load_time: tuple = (0.5, 1.5)          # s to ramp the sideways push in
 
-
-# ======================================================================
-# Model
-# ======================================================================
-
-def _v(x):
-    return " ".join(f"{float(a):.6g}" for a in x)
-
-
-# Builds the MJCF from the DroneConfig geometry. Mass properties are NOT taken
-# from the config: MuJoCo computes them from the geoms, and they are read back
-# with true_config_from_model() so training uses exactly the simulated values.
-def build_xml(cfg, gs):
-    g_pts = build_drone_graph(cfg, com_relative=False)
-    pts = g_pts["rest_nodes"].numpy()
-    pad_idx = g_pts["pad_indices"]
-    tip = np.asarray(cfg.rod_tip)
-    axis = tip - np.asarray(cfg.rod_base)
-    axis = axis / np.linalg.norm(axis)
-    pad_r = max([r for r, _ in cfg.pad_rings], default=0.0) + cfg.pad_contact_radius
-
-    rotors = ""
-    for i, (p, a) in enumerate(zip(cfg.rotor_pos, cfg.rotor_axis)):
-        rotors += f"""
-      <geom name="arm{i}" type="capsule" fromto="0 0 0 {_v(p)}" size="0.008" mass="0.04" rgba=".3 .3 .3 1"/>
-      <geom name="prop{i}" type="cylinder" pos="{_v(p)}" zaxis="{_v(a)}" size="0.06 0.005" mass="0.05" rgba=".2 .5 .9 .5"/>
-      <site name="rotor{i}" pos="{_v(p)}" zaxis="{_v(a)}"/>"""
-
-    pads = ""
-    for k, j in enumerate(pad_idx):
-        pads += f"""
-      <geom name="pad{k}" type="sphere" pos="{_v(pts[j])}" size="{cfg.pad_contact_radius}" mass="0.001"
-            friction="{gs.mu} 0.005 0.0001" condim="3" solref="{_v(gs.pad_solref)}" rgba=".9 .2 .2 1"/>"""
-
-    acts = ""
-    for i, s in enumerate(cfg.spin_dir):
-        acts += f"""
-    <general name="m{i}" site="rotor{i}" gear="0 0 1 0 0 {-s * cfg.k_m / cfg.k_f:.6g}"
-             dyntype="filter" dynprm="{gs.motor_tau}" gainprm="1" biastype="none"
-             ctrllimited="true" ctrlrange="0 100"/>"""
-
-    return f"""
-<mujoco model="aerial_manipulator">
-  <option timestep="{gs.timestep}" gravity="0 0 {-cfg.gravity}" density="1.225"
-          viscosity="1.8e-5" integrator="Euler" cone="elliptic"/>
-  <default><geom contype="1" conaffinity="0"/></default>
-  <worldbody>
-    <light pos="0 0 4"/>
-    <geom name="floor" type="plane" size="5 5 .1" contype="0" conaffinity="0" rgba=".8 .8 .8 1"/>
-    <!-- mocap body: MuJoCo does not re-pose static worldbody geoms when model.geom_pos changes -->
-    <body name="wall_body" mocap="true" pos="0 0 -10">
-      <geom name="wall" type="box" size="0.02 2 2" contype="0" conaffinity="1"
-            friction="{gs.mu} 0.005 0.0001" solref="{_v(gs.wall_solref)}" rgba=".7 .6 .5 .6"/>
-    </body>
-    <body name="drone" pos="0 0 1">
-      <freejoint/>
-      <geom name="core" type="box" size="0.06 0.06 0.025" mass="0.9" fluidshape="ellipsoid" rgba=".1 .1 .1 1"/>{rotors}
-      <geom name="rod" type="capsule" fromto="{_v(cfg.rod_base)} {_v(tip - 0.012 * axis)}" size="0.006" mass="0.06"
-            fluidshape="ellipsoid" rgba=".6 .6 .6 1"/>
-      <geom name="sensor" type="cylinder" pos="{_v(np.asarray(cfg.rod_base) + 0.02 * axis)}" zaxis="{_v(axis)}"
-            size="0.015 0.012" mass="0.05" rgba=".9 .7 .1 1"/>
-      <geom name="pad_disk" type="cylinder" pos="{_v(tip - 0.002 * axis)}" zaxis="{_v(axis)}"
-            size="{pad_r:.4f} 0.002" mass="0.01" contype="0" conaffinity="0" rgba=".9 .4 .4 .6"/>{pads}
-    </body>
-  </worldbody>
-  <actuator>{acts}
-  </actuator>
-</mujoco>"""
+    # ---- fully actuated drones only (DroneConfig.fully_actuated) ----
+    # Attitude targets: this fraction of trajectories gets a random body
+    # roll/pitch target per segment (+-attitude_max_deg); the rest fly level.
+    attitude_prob: float = 0.7
+    attitude_max_deg: float = 6.0     # holding tilt theta costs m g sin(theta) of the ~16 N sideways authority
+    # Yaw budget for the push cap, as a fraction of the most yaw torque the
+    # rotors can add at hover (computed from the allocation). The quad uses
+    # the fixed yaw_torque_budget above instead.
+    yaw_budget_frac: float = 0.3
+    # Peak COM acceleration of the reference, as a fraction of the sideways
+    # force the rotors can add at level hover (/ mass). A drone that does not
+    # tilt has only that much sideways authority (~2.7 m/s^2 for the hexa); the
+    # quad's segment timings ask for up to ~8 m/s^2, so faster segments are
+    # stretched (drone_scenarios.limit_segment_accel).
+    accel_frac: float = 0.5
 
 
-# Reads the simulated mass properties back into a DroneConfig. The body frame
-# of the MuJoCo drone IS the mocap frame, so body_ipos is the COM offset.
-def true_config_from_model(model, cfg, gs):
-    bid = model.body("drone").id
-    Ri = np.zeros(9)
-    mujoco.mju_quat2Mat(Ri, model.body_iquat[bid])
-    Ri = Ri.reshape(3, 3)
-    I = Ri @ np.diag(model.body_inertia[bid]) @ Ri.T
-    return dataclasses.replace(
-        cfg, mass=float(model.body_mass[bid]),
-        inertia=tuple(tuple(float(x) for x in row) for row in I),
-        com_offset=tuple(float(x) for x in model.body_ipos[bid]),
-        dt=gs.timestep * gs.substeps)
+# Settings that differ for a drone preset (python mujoco_drone_generator.py --drone fa_hexa).
+# The hexa is ~4x the quad's mass with ~16 N of sideways force at level, so it pushes harder.
+PRESET_GEN_SETTINGS = {"quad": {}, "fa_hexa": dict(push_force=(0.2, 6.0))}
 
 
-# ======================================================================
-# Controller
-# ======================================================================
-
-def _hat(w):
-    return np.array([[0, -w[2], w[1]], [w[2], 0, -w[0]], [-w[1], w[0], 0]])
-
-
-def _quat2mat(q):
-    R = np.zeros(9)
-    mujoco.mju_quat2Mat(R, q)
-    return R.reshape(3, 3)
+# Yaw budget (N m) the pad's moments may use when the push force is capped.
+def yaw_budget(cfg, gs):
+    if not cfg.fully_actuated:
+        return gs.yaw_torque_budget
+    return gs.yaw_budget_frac * max_hover_torque(cfg, *thrust_limits(cfg, gs), axis=2)
 
 
-def _mat2quat(R):
-    q = np.zeros(4)
-    mujoco.mju_mat2Quat(q, R.reshape(-1))
-    return q
-
-
-# Geometric tracking controller on SE(3) with a thrust/torque mixer.
-class GeometricController:
-
-    def __init__(self, cfg, rng, t_max):
-        self.m, self.g = cfg.mass, cfg.gravity
-        self.J = np.asarray(cfg.inertia)
-        c = np.asarray(cfg.com_offset)
-        rp = np.asarray(cfg.rotor_pos) - c
-        s = np.asarray(cfg.spin_dir, dtype=float)
-        # Mixer for (near-)vertical rotor axes: [f, Mx, My, Mz] = A @ T
-        self.A = np.vstack([np.ones(len(rp)), rp[:, 1], -rp[:, 0], -s * cfg.k_m / cfg.k_f])
-        self.A_inv = np.linalg.pinv(self.A)
-        self.t_min, self.t_max = 0.05 * self.m * self.g / len(rp), t_max
-
-        # Gains, randomized +-20% per trajectory so the data is not tied to one tuning.
-        wp = 4.0 * rng.uniform(0.8, 1.2)                     # position bandwidth, rad/s
-        wr = 15.0 * rng.uniform(0.8, 1.2)                    # roll/pitch bandwidth, rad/s
-        wy = 4.0 * rng.uniform(0.8, 1.2)                     # yaw bandwidth: slow, it has little authority
-        self.kp, self.kv = wp ** 2, 2.0 * 0.9 * wp
-        Jd = np.diag(self.J)
-        bw = np.array([wr, wr, wy])
-        self.kR, self.kW = Jd * bw ** 2, Jd * 2.0 * 0.9 * bw
-        self.max_tilt = math.radians(35.0)
-        self.gains = dict(wp=wp, wr=wr, wy=wy)
-
-    # Returns rotor thrust commands (N).
-    def __call__(self, com, v, R, w_body, p_d, v_d, a_d, F_ff, heading):
-        e3 = np.array([0.0, 0.0, 1.0])
-        F = self.m * (-self.kp * (com - p_d) - self.kv * (v - v_d) + a_d + self.g * e3) + F_ff
-
-        # Limit tilt.
-        b3 = F / np.linalg.norm(F)
-        tilt = math.acos(np.clip(b3 @ e3, -1.0, 1.0))
-        if tilt > self.max_tilt:
-            h = b3 - (b3 @ e3) * e3
-            h /= np.linalg.norm(h) + 1e-12
-            b3 = math.cos(self.max_tilt) * e3 + math.sin(self.max_tilt) * h
-
-        b2 = np.cross(b3, heading)
-        b2 /= np.linalg.norm(b2)
-        R_d = np.column_stack([np.cross(b2, b3), b2, b3])
-        f = F @ (R @ e3)
-
-        E = R_d.T @ R - R.T @ R_d
-        e_R = 0.5 * np.array([E[2, 1], E[0, 2], E[1, 0]])
-        M = -self.kR * e_R - self.kW * w_body + np.cross(w_body, self.J @ w_body)
-        return self.mix(f, M)
-
-    # Mixer with roll/pitch priority. Yaw authority on a quad is small
-    # (k_m/k_f ~ 1.6 cm of lever), so roll/pitch and collective are allocated
-    # first, then the largest fraction of the yaw torque that still fits is
-    # added. (Dropping yaw entirely when it does not fit leaves a large yaw
-    # error with no correction at all, and the drone spins up against the wall.)
-    def mix(self, f, M):
-        T0 = self.A_inv @ np.r_[f, M[0], M[1], 0.0]
-        if T0.max() > self.t_max:
-            T0 = T0 + (self.t_max - T0.max())
-        elif T0.min() < self.t_min:
-            T0 = T0 + (self.t_min - T0.min())
-        Ty = self.A_inv @ np.r_[0.0, 0.0, 0.0, M[2]]
-        s = 1.0
-        for t0, ty in zip(T0, Ty):
-            if ty > 1e-12:
-                s = min(s, (self.t_max - t0) / ty)
-            elif ty < -1e-12:
-                s = min(s, (t0 - self.t_min) / -ty)
-        return np.clip(T0 + max(s, 0.0) * Ty, self.t_min, self.t_max)
-
-
-# ======================================================================
-# Scenarios: pad-center waypoints in the wall frame + push-force profile
-# ======================================================================
-
-class Reference:
-    """Segments of (duration, target, phase); targets are d (pad-center distance
-    from the wall along n), a/b (along-wall coordinates), F (push force, N),
-    Fa/Fb (sideways push along t1/t2, N). Each segment is a min-jerk move from
-    the previous target. A target with an "arc" entry (center_a, center_b,
-    radius, start angle, swept angle) moves a/b along that circle instead of a
-    straight line, with the same min-jerk timing."""
-
-    def __init__(self, start, segments):
-        self.start = dict(start)
-        self.t, self.vals, self.phase, self.arcs = [0.0], [dict(start)], [], []
-        for dur, tgt, ph in segments:
-            tgt = dict(tgt)
-            self.arcs.append(tgt.pop("arc", None))
-            v = dict(self.vals[-1])
-            v.update(tgt)
-            self.t.append(self.t[-1] + dur)
-            self.vals.append(v)
-            self.phase.append(PHASES[ph])
-        self.T = self.t[-1]
-
-    def __call__(self, t):
-        t = min(max(t, 0.0), self.T - 1e-9)
-        k = int(np.searchsorted(self.t, t, side="right") - 1)
-        tau = (t - self.t[k]) / (self.t[k + 1] - self.t[k])
-        s = tau ** 3 * (10 - 15 * tau + 6 * tau ** 2)
-        a, b = self.vals[k], self.vals[k + 1]
-        out = {key: a[key] + (b[key] - a[key]) * s for key in a}
-        if self.arcs[k] is not None:
-            ca, cb, radius, th0, dth = self.arcs[k]
-            th = th0 + dth * s
-            out["a"], out["b"] = ca + radius * math.cos(th), cb + radius * math.sin(th)
-        return out, self.phase[k]
-
-
-# Builds a randomized scenario. r_c = pad contact-sphere radius: a pad-center
-# distance of r_c means the pad is just touching (if it is flat to the wall).
-# All ranges come from gs (GenSettings). Returns the start values and the list of segments.
-def make_scenario(kind, rng, r_c, duration, gs, yaw_force_cap=None):
-    U = rng.uniform
-    logU = lambda lo, hi: math.exp(U(math.log(lo), math.log(hi)))     # log-uniform
-    start = dict(d=U(0.25, 0.6), a=U(-0.3, 0.3), b=U(-0.3, 0.3), F=0.0, Fa=0.0, Fb=0.0)
-    cur, seg = dict(start), []
-
-    def add(dur, phase, **tgt):
-        seg.append((dur, tgt, phase))
-        cur.update(tgt)
-
-    def approach(d_target, speed):
-        add(max(abs(cur["d"] - d_target) / speed, 0.3), "approach", d=d_target)
-
-    add(U(0.3, 0.6), "free")                                          # settle
-    if kind == "free":
-        while sum(sg[0] for sg in seg) < duration:
-            add(U(0.8, 2.0), "free", d=U(0.4, 1.2), a=U(-0.6, 0.6), b=U(-0.4, 0.4))
-    elif kind == "hover_near":
-        # Dense hovering just off the wall (gate partly open, no force), plus a
-        # few farther standoffs. d is the pad-center distance, so with a yaw
-        # offset a ring node can touch on the closest hovers; that is fine.
-        near = r_c + U(*gs.hover_near_gap, size=gs.hover_near_count)
-        far = U(*gs.hover_far_dist, size=int(rng.integers(0, gs.hover_far_max + 1)))
-        for d in sorted(np.r_[near, far], reverse=True):
-            add(U(0.6, 1.2), "approach", d=d)
-            add(U(0.8, 1.5), "hover_near")
-        add(U(0.6, 1.0), "release", d=U(0.3, 0.6))
-    elif kind == "tap":
-        # Impacts: fly in with no push, touch briefly, back off.
-        for _ in range(int(rng.integers(1, 3))):
-            approach(r_c - U(0.0, 0.01), U(*gs.tap_approach_speed))
-            add(U(0.1, 0.4), "hold")
-            add(U(0.5, 1.0), "release", d=U(0.15, 0.4))
-    elif kind in ("push", "slide", "arc"):
-        # Pushing is limited by yaw authority. Horizontal friction at the pad,
-        # and the normal force when the rod is yawed off the wall normal, act
-        # on the rod's ~0.4 m lever arm, and a quad's yaw torque is only
-        # k_m/k_f ~ 1.6 cm times the thrust differential. The yawed-rod moment
-        # also grows with the yaw error (pushing a stick against a wall), so
-        # once yaw saturates it runs away. yaw_force_cap(c) is the largest push
-        # that keeps both inside the yaw budget when the horizontal tangential
-        # load is c * mu * F.
-        slides = []
-        if kind == "slide":
-            for _ in range(int(rng.integers(1, gs.slide_count_max + 1))):
-                speed = logU(*gs.slide_speed)
-                slides.append((U(0, 2 * math.pi), min(U(*gs.slide_dist), gs.slide_max_time * speed), speed))
-        # Sideways-loaded hold: (direction in the wall plane, load as a fraction of mu * F)
-        side = (U(0, 2 * math.pi), U(*gs.side_load_frac)) if U() < gs.side_load_prob else None
-
-        f_max = gs.push_force[1]
-        if yaw_force_cap is not None:
-            caps = [yaw_force_cap(0.0)] + [yaw_force_cap(abs(math.cos(a))) for a, _, _ in slides]
-            if kind == "arc":
-                caps.append(yaw_force_cap(1.0))                       # friction turns through every direction
-            if side is not None:
-                caps.append(yaw_force_cap(side[1] * abs(math.cos(side[0]))))
-            f_max = min([f_max] + caps)
-        f_min = min(gs.push_force[0], 0.5 * f_max)
-
-        approach(r_c - U(0.0, 0.005), logU(*gs.push_approach_speed))
-        add(U(0.3, 0.6), "hold", F=logU(f_min, f_max))                # ramp the push in
-        add(U(0.5, 1.5), "hold", F=logU(f_min, f_max))                # vary it while holding
-
-        # Load the friction sideways without (or barely) sliding, then unload.
-        if side is not None:
-            ang, frac = side
-            f_t = frac * gs.mu * cur["F"]
-            add(U(*gs.side_load_time), "hold", Fa=f_t * math.cos(ang), Fb=f_t * math.sin(ang))
-            add(U(0.3, 0.6), "hold", Fa=0.0, Fb=0.0)
-
-        for ang, dist, speed in slides:
-            add(dist / speed, "slide", a=cur["a"] + dist * math.cos(ang),
-                b=cur["b"] + dist * math.sin(ang))
-
-        if kind == "arc":
-            radius, speed = U(*gs.arc_radius), U(*gs.arc_speed)
-            th0 = U(0, 2 * math.pi)                                   # angle of the current point on the circle
-            dth = rng.choice([-1.0, 1.0]) * 2 * math.pi * U(*gs.arc_laps)
-            ca, cb = cur["a"] - radius * math.cos(th0), cur["b"] - radius * math.sin(th0)
-            end = dict(a=ca + radius * math.cos(th0 + dth), b=cb + radius * math.sin(th0 + dth))
-            add(abs(dth) * radius / speed, "slide", arc=(ca, cb, radius, th0, dth), **end)
-
-        add(U(0.3, 0.6), "release", F=0.0)
-        add(U(0.6, 1.0), "release", d=U(0.2, 0.5))
-    else:
-        raise ValueError(kind)
-    add(U(0.3, 0.6), "free")
-    return start, seg
+# Fully actuated drones only: random attitude targets (attitude_prob of the
+# trajectories), then segments stretched to the drone's sideways authority.
+# p_tip_of(r) = pad-center waypoint, tip_body = pad center from the COM (body).
+# Returns (start, segments) unchanged for a quad (and draws nothing from rng).
+def shape_reference(cfg, gs, s0, seg, rng, R_h, p_tip_of, tip_body):
+    if not cfg.fully_actuated:
+        return s0, seg
+    if rng.random() < gs.attitude_prob:
+        s0, seg = add_attitude_targets(s0, seg, rng, gs.attitude_max_deg)
+    a_max = gs.accel_frac * min_hover_side_force(cfg, *thrust_limits(cfg, gs)) / cfg.mass
+    com_of = lambda r: p_tip_of(r) - reference_attitude(R_h, r) @ tip_body
+    return s0, limit_segment_accel(s0, seg, com_of, a_max)
 
 
 # ======================================================================
 # Simulation of one trajectory
 # ======================================================================
 
-class Crash(Exception):
-    pass
-
-
-# ======================================================================
-# MuJoCo plant: one physics substep at a time
-# ======================================================================
-
-class MujocoDronePlant:
-    """The MuJoCo drone with the forces MuJoCo does not model added by hand
-    (per-rotor drag at each hub), plus force logging. Used by the data
-    generator and by the closed-loop evaluation, so both run identical physics.
-
-    substep(wind, t) applies rotor drag for the given wind, advances one MuJoCo
-    timestep, and returns what acted during that step: rotor thrusts (M), aero
-    force (3, MuJoCo fluid + rotor drag), contact force on the pad (3), its
-    torque about the COM (3), and the per-pad-sphere contact forces (P, 3).
-    Raises Crash if any drone geom other than a pad sphere touches the wall."""
-
-    def __init__(self, model, cfg_true, gs, data=None):
-        self.model, self.cfg, self.gs = model, cfg_true, gs
-        self.data = data if data is not None else mujoco.MjData(model)
-        self.bid = model.body("drone").id
-        self.wall_gid = model.geom("wall").id
-        n_pad = len(build_drone_graph(cfg_true)["pad_indices"])
-        self.pad_gids = {model.geom(f"pad{k}").id: k for k in range(n_pad)}
-        self.drone_gids = set(np.flatnonzero(model.geom_bodyid == self.bid).tolist())
-        self.c_off = np.asarray(cfg_true.com_offset)
-        self.rotor_r = np.asarray(cfg_true.rotor_pos) - self.c_off          # hubs relative to the COM, body frame
-        a = np.asarray(cfg_true.rotor_axis, dtype=float)
-        self.rotor_a = a / np.linalg.norm(a, axis=1, keepdims=True)
-        self.qfrc_fluid = "qfrc_fluid" if hasattr(self.data, "qfrc_fluid") else "qfrc_passive"
-        self._f6 = np.zeros(6)
-
-    # COM position, attitude, body angular velocity, COM velocity (world).
-    def state(self):
-        d = self.data
-        R = _quat2mat(d.qpos[3:7])
-        w_b = d.qvel[3:6].copy()
-        return d.qpos[0:3] + R @ self.c_off, R, w_b, d.qvel[0:3] + np.cross(R @ w_b, R @ self.c_off)
-
-    def substep(self, wind, t):
-        m, d, cfg, gs = self.model, self.data, self.cfg, self.gs
-        com, R, w_b, v_com = self.state()
-
-        # Per-rotor drag at each hub, from that hub's local airspeed.
-        m.opt.wind[:] = wind
-        omega_true = np.sqrt(np.maximum(d.act, 0.0) / cfg.k_f)
-        r_hub = self.rotor_r @ R.T                                           # (M,3) lever arms, world
-        a_hub = self.rotor_a @ R.T                                           # (M,3) rotor axes, world
-        u_hub = wind - (v_com + np.cross(R @ w_b, r_hub))                    # local airspeed at each hub
-        u_perp = u_hub - np.sum(u_hub * a_hub, axis=1, keepdims=True) * a_hub
-        F_hub = cfg.mass * gs.k_rotor * omega_true[:, None] * u_perp         # (M,3)
-        F_rd = F_hub.sum(0)
-        d.xfrc_applied[self.bid, :3] = F_rd                                  # xfrc_applied acts at the COM,
-        d.xfrc_applied[self.bid, 3:] = np.cross(r_hub, F_hub).sum(0)         # so add the hubs' moment
-
-        mujoco.mj_step(m, d)
-
-        # Forces used during the step just taken (MuJoCo leaves them from the
-        # pre-integration forward pass).
-        Fc, tc = np.zeros(3), np.zeros(3)
-        pad = np.zeros((len(self.pad_gids), 3))
-        for i in range(d.ncon):
-            con = d.contact[i]
-            if self.wall_gid not in (con.geom1, con.geom2):
-                continue
-            other = con.geom2 if con.geom1 == self.wall_gid else con.geom1
-            if other not in self.pad_gids:
-                if other in self.drone_gids:
-                    raise Crash(f"{m.geom(other).name} hit the wall at t={t:.2f}s")
-                continue
-            mujoco.mj_contactForce(m, d, i, self._f6)
-            F = con.frame.reshape(3, 3).T @ self._f6[:3]                     # force on geom2
-            if other == con.geom1:
-                F = -F
-            Fc += F
-            tc += np.cross(con.pos - com, F)
-            pad[self.pad_gids[other]] += F
-        return d.actuator_force.copy(), getattr(d, self.qfrc_fluid)[0:3] + F_rd, Fc, tc, pad
-
-
-# Verlet alignment: x is a per-substep log (n_sub, ...); returns per-frame values
-# with triangle weights over the two intervals around each frame, which is
-# exactly what the second difference of the recorded positions sees.
-def align_to_frames(x, S, T_frames, first=None):
-    w = np.r_[np.arange(S), S - np.arange(S)] / S ** 2                     # sums to 1
-    out = np.empty((T_frames,) + x.shape[1:])
-    for k in range(1, T_frames):
-        out[k] = np.tensordot(w, x[(k - 1) * S:(k + 1) * S], axes=1)
-    out[0] = out[1] if first is None else first
-    return out
-
-
-# In-plane wall axes: t1 horizontal, t2 "up the wall".
-def wall_tangents(n):
-    t1 = np.cross(n, [0.0, 0.0, 1.0])
-    t1 /= np.linalg.norm(t1)
-    return t1, np.cross(t1, n)
-
-
-# Feedforward force the controller adds for the reference r: F into the wall,
-# plus the sideways load (Fa along t1, Fb along t2) of the loaded holds.
-def push_force_vector(r, n, t1, t2):
-    return -n * r["F"] + t1 * r["Fa"] + t2 * r["Fb"]
-
-
-# Places the wall (a mocap box) so its surface passes through wall_point with
-# outward normal n. MuJoCo does not re-pose static worldbody geoms when
-# model.geom_pos changes, which is why the wall lives on a mocap body.
-def set_wall_pose(model, data, n, wall_point):
-    t1, _ = wall_tangents(n)
-    half = model.geom_size[model.geom("wall").id][0]
-    data.mocap_pos[0] = wall_point - half * n
-    data.mocap_quat[0] = _mat2quat(np.column_stack([n, t1, np.cross(n, t1)]))   # box local x = n
-
-
 # pulse: optional (t_start, t_end, force_xyz) external force on the drone, used
 # only by audit_checks.py to show that perturbing the future leaves past rotor
 # speeds unchanged.
 def simulate_trajectory(model, cfg_true, gs, rng, pulse=None):
     plant = MujocoDronePlant(model, cfg_true, gs)
-    data = plant.data
     S, h = gs.substeps, gs.timestep
     dt = h * S
     c_off = plant.c_off
-    m, M = cfg_true.mass, len(cfg_true.rotor_pos)
-    t_hover = m * cfg_true.gravity / M
-    ctrl = GeometricController(cfg_true, rng, gs.t_max_over_hover * t_hover)
+    M = len(cfg_true.rotor_pos)
+    t_hover = hover_thrusts(cfg_true)
+    ctrl = make_controller(cfg_true, gs, rng)
 
     # ---- wall pose: random yaw, sometimes tilted ----
     psi = rng.uniform(0, 2 * math.pi)
@@ -612,7 +249,7 @@ def simulate_trajectory(model, cfg_true, gs, rng, pulse=None):
     n = np.array([-math.cos(beta) * math.cos(psi), -math.cos(beta) * math.sin(psi), math.sin(beta)])
     wall_point = np.array([0.0, 0.0, 1.5])
     t1, t2 = wall_tangents(n)
-    set_wall_pose(model, data, n, wall_point)
+    plant.set_wall(n, wall_point)
 
     # ---- heading: rod (body x) points at the wall, plus a random yaw offset ----
     nh = -n.copy()
@@ -621,21 +258,24 @@ def simulate_trajectory(model, cfg_true, gs, rng, pulse=None):
     yo = math.radians(rng.uniform(-1, 1) * gs.yaw_offset_max_deg)
     heading = np.array([[math.cos(yo), -math.sin(yo), 0], [math.sin(yo), math.cos(yo), 0], [0, 0, 1]]) @ nh
     R_h = np.column_stack([heading, np.cross([0, 0, 1.0], heading), [0, 0, 1.0]])
-    tip_off = R_h @ (np.asarray(cfg_true.rod_tip) - c_off)      # pad center relative to COM, level
+    tip_body = np.asarray(cfg_true.rod_tip) - c_off             # pad center relative to COM, body frame
 
     # ---- scenario ----
     kinds, probs = zip(*gs.scenario_probs)
     kind = str(rng.choice(kinds, p=np.asarray(probs) / sum(probs)))
-    lever = float(np.linalg.norm((np.asarray(cfg_true.rod_tip) - c_off)[:2]))
-    yaw_cap = lambda c_h: gs.yaw_torque_budget / (lever * (gs.mu * c_h + abs(math.sin(yo))) + 1e-9)
+    lever = float(np.linalg.norm(tip_body[:2]))
+    yaw_cap = yaw_force_cap(yaw_budget(cfg_true, gs), lever, gs.mu, yo)
     s0, seg = make_scenario(kind, rng, cfg_true.pad_contact_radius, rng.uniform(*gs.duration), gs, yaw_cap)
+    p_tip_of = lambda r: wall_point + r["d"] * n + r["a"] * t1 + r["b"] * t2
+    s0, seg = shape_reference(cfg_true, gs, s0, seg, rng, R_h, p_tip_of, tip_body)
     ref = Reference(s0, seg)
     T_frames = int(ref.T / dt) + 1
 
+    # COM reference that puts the pad center on the waypoint at the reference attitude
     def p_com_ref(t):
         r, ph = ref(t)
-        p_tip = wall_point + r["d"] * n + r["a"] * t1 + r["b"] * t2
-        return p_tip - tip_off, push_force_vector(r, n, t1, t2), ph
+        R_d = reference_attitude(R_h, r)
+        return p_tip_of(r) - R_d @ tip_body, push_force_vector(r, n, t1, t2), ph, R_d
 
     # ---- wind: mean + OU gusts ----
     w_mean = np.zeros(3)
@@ -648,12 +288,7 @@ def simulate_trajectory(model, cfg_true, gs, rng, pulse=None):
     ex = np.zeros(M)
 
     # ---- initial state: hovering at the start reference ----
-    p0, _, _ = p_com_ref(0.0)
-    data.qpos[0:3] = p0 - R_h @ c_off
-    data.qpos[3:7] = _mat2quat(R_h)
-    data.act[:] = t_hover
-    data.ctrl[:] = t_hover
-    mujoco.mj_forward(model, data)
+    plant.reset(p_com_ref(0.0)[0], R_h, t_hover)
 
     n_sub = T_frames * S
     log_thrust = np.zeros((n_sub, M))
@@ -666,33 +301,34 @@ def simulate_trajectory(model, cfg_true, gs, rng, pulse=None):
         com, R, w_b, v_com = plant.state()
 
         # Crash checks.
-        if not np.all(np.isfinite(data.qpos)) or com[2] < 0.2 or (R @ [0, 0, 1])[2] < 0.5:
+        if not plant.finite() or com[2] < 0.2 or (R @ [0, 0, 1])[2] < 0.5:
             raise Crash(f"state left the envelope at t={t:.2f}s")
 
         # Record the frame state (before the substeps that follow it).
         if j % S == 0:
-            frames["pos"].append(data.qpos[0:3].copy())
-            frames["quat"].append(data.qpos[3:7].copy())
-            frames["rotor_speed_cmd"].append(np.sqrt(np.maximum(data.ctrl, 0) / cfg_true.k_f))
+            pos, quat = plant.pose()
+            frames["pos"].append(pos)
+            frames["quat"].append(quat)
+            frames["rotor_speed_cmd"].append(np.sqrt(np.maximum(plant.command(), 0) / cfg_true.k_f))
             frames["wind"].append(w_mean + gust)
             frames["phase"].append(p_com_ref(t)[2])
 
         # Controller at its own rate.
         if j % gs.ctrl_every == 0:
             eps = 1e-3
-            p_d, F_push, _ = p_com_ref(t)
+            p_d, F_push, _, R_d = p_com_ref(t)
             v_d = (p_com_ref(t + eps)[0] - p_com_ref(t - eps)[0]) / (2 * eps)
             a_d = (p_com_ref(t + eps)[0] - 2 * p_d + p_com_ref(t - eps)[0]) / eps ** 2
             if gs.aero_feedforward and j > 0:
                 F_push = F_push - log_Fa[j - 1]                        # aero force of the last substep
-            T_cmd = ctrl(com, v_com, R, w_b, p_d, v_d, a_d, F_push, heading)
+            T_cmd = ctrl(com, v_com, R, w_b, p_d, v_d, a_d, F_push, heading, R_d)
             hc = gs.ctrl_every * h
             ex += -ex * hc / ex_tau + ex_sig * math.sqrt(2 * hc / ex_tau) * rng.normal(size=M)
-            data.ctrl[:] = np.clip(T_cmd * (1.0 + ex), 0.0, ctrl.t_max)
+            plant.set_command(np.clip(T_cmd * (1.0 + ex), 0.0, ctrl.t_max))
 
         # Wind gusts, then one physics substep (rotor drag + MuJoCo + force logging).
         if pulse is not None:
-            data.qfrc_applied[0:3] = pulse[2] if pulse[0] <= t < pulse[1] else 0.0
+            plant.data.qfrc_applied[0:3] = pulse[2] if pulse[0] <= t < pulse[1] else 0.0
         gust += -gust * h / 1.0 + gust_sig * math.sqrt(2 * h) * np.r_[rng.normal(size=2), 0.2 * rng.normal()]
         log_thrust[j], log_Fa[j], log_Fc[j], log_tc[j], log_pad[j] = plant.substep(w_mean + gust, t)
 
@@ -700,7 +336,7 @@ def simulate_trajectory(model, cfg_true, gs, rng, pulse=None):
     thrust_al = align(log_thrust)
     traj = dict(
         pos=frames["pos"], quat=frames["quat"],
-        rotor_speed=np.sqrt(np.maximum(thrust_al, 0.0) / cfg_true.k_f),
+        rotor_speed=np.sqrt(np.maximum(thrust_al, 0.0) / cfg_true.k_f), rotor_thrust=thrust_al,
         rotor_speed_cmd=frames["rotor_speed_cmd"], wind=frames["wind"], phase=frames["phase"],
         F_contact=align(log_Fc), tau_contact=align(log_tc), F_pad=align(log_pad), F_aero=align(log_Fa))
     # Positions in float64: float32 resolves only ~1e-7 m at 1.5 m from the
@@ -714,6 +350,7 @@ def simulate_trajectory(model, cfg_true, gs, rng, pulse=None):
                         k_f=cfg_true.k_f, k_m=cfg_true.k_m, mu=gs.mu, k_rotor=gs.k_rotor,
                         scenario=kind, wind_mean=w_mean.tolist(), excitation=ex_sig,
                         wall_tilt_deg=math.degrees(beta), yaw_offset_deg=math.degrees(yo),
+                        fully_actuated=cfg_true.fully_actuated, attitude_targets="roll" in s0,
                         aero_label_source=plant.qfrc_fluid, gen_settings=dataclasses.asdict(gs), **ctrl.gains)
     return traj
 
@@ -819,13 +456,14 @@ if __name__ == "__main__":
     ap.add_argument("--speed", type=float, default=1.0)
     ap.add_argument("--wind-max", type=float, default=None, help="mean wind, m/s (default: GenSettings.wind_max)")
     ap.add_argument("--gust-std", type=float, default=None, help="gust std, m/s (default: GenSettings.gust_std)")
+    ap.add_argument("--drone", default="quad", choices=sorted(PRESETS), help="drone preset (drone_config.PRESETS)")
     a = ap.parse_args()
     if a.replay:
         replay(a.replay, a.speed)
     else:
-        gs = GenSettings()
+        gs = dataclasses.replace(GenSettings(), **PRESET_GEN_SETTINGS[a.drone])
         if a.wind_max is not None:
             gs = dataclasses.replace(gs, wind_max=a.wind_max)
         if a.gust_std is not None:
             gs = dataclasses.replace(gs, gust_std=a.gust_std)
-        generate(a.out, a.n, a.start, a.seed, gs=gs, verify=a.verify)
+        generate(a.out, a.n, a.start, a.seed, cfg=PRESETS[a.drone](), gs=gs, verify=a.verify)

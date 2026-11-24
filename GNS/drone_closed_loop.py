@@ -3,7 +3,7 @@ once with MuJoCo as the plant (ground truth) and once with the learned model as
 the plant, and compare.
 
 WHY CLOSED LOOP
-A quadrotor is open-loop unstable: replaying the logged rotor speeds from a
+A multirotor is open-loop unstable: replaying the logged rotor speeds from a
 recorded start diverges from tiny errors whatever the model quality, so the
 cube-style open-loop rollout says nothing here. But the drone is never flown
 open loop. With the controller in the loop, both plants are pulled toward the
@@ -16,7 +16,8 @@ check speak to that.
 
 WHAT IS SHARED BETWEEN THE TWO RUNS
   scenario   wall pose, heading, reference waypoints and push profile, wind
-  controller the generator's geometric controller and gains, run ONCE PER FRAME
+  controller the generator's controller (geometric for a quad, full-wrench for a
+             fully actuated drone) and gains, run ONCE PER FRAME
              (100 Hz) from a finite-difference state estimate (velocity and
              angular velocity from the last two poses, like a mocap system).
              The training data uses the same 100 Hz rate with the true
@@ -82,9 +83,14 @@ def sample_eval_scenario(cfg_true, gs, rng, kind=None):
     if kind is None:
         kinds, probs = zip(*gs.scenario_probs)
         kind = str(rng.choice(kinds, p=np.asarray(probs) / sum(probs)))
-    lever = float(np.linalg.norm((np.asarray(cfg_true.rod_tip) - c_off)[:2]))
-    yaw_cap = lambda c_h: gs.yaw_torque_budget / (lever * (gs.mu * c_h + abs(math.sin(yo))) + 1e-9)
+    tip_body = np.asarray(cfg_true.rod_tip) - c_off
+    lever = float(np.linalg.norm(tip_body[:2]))
+    yaw_cap = MG.yaw_force_cap(MG.yaw_budget(cfg_true, gs), lever, gs.mu, yo)
     s0, seg = MG.make_scenario(kind, rng, cfg_true.pad_contact_radius, rng.uniform(*gs.duration), gs, yaw_cap)
+    t1, t2 = MG.wall_tangents(n)
+    R_h = np.column_stack([heading, np.cross([0, 0, 1.0], heading), [0, 0, 1.0]])
+    s0, seg = MG.shape_reference(cfg_true, gs, s0, seg, rng, R_h,
+                                 lambda r: wall_point + r["d"] * n + r["a"] * t1 + r["b"] * t2, tip_body)
     T_frames = int(MG.Reference(s0, seg).T / dt) + 1
 
     w_mean = np.zeros(3)
@@ -92,7 +98,8 @@ def sample_eval_scenario(cfg_true, gs, rng, kind=None):
         w_ang = rng.uniform(0, 2 * math.pi)
         w_mean = rng.uniform(0, gs.wind_max) * np.array([math.cos(w_ang), math.sin(w_ang), 0.0])
 
-    gains = dict(wp=4.0 * rng.uniform(0.8, 1.2), wr=15.0 * rng.uniform(0.8, 1.2), wy=4.0 * rng.uniform(0.8, 1.2))
+    base = (MG.FullyActuatedController if cfg_true.fully_actuated else MG.GeometricController).BASE_GAINS
+    gains = {k: v * rng.uniform(0.8, 1.2) for k, v in base.items()}
 
     ex_sig, ex_tau = rng.uniform(0, gs.excite_max), 0.05
     ex = np.zeros((T_frames, M))
@@ -107,14 +114,8 @@ def sample_eval_scenario(cfg_true, gs, rng, kind=None):
 
 
 def _controller(cfg_true, gs, gains):
-    t_hover = cfg_true.mass * cfg_true.gravity / len(cfg_true.rotor_pos)
-    ctrl = MG.GeometricController(cfg_true, np.random.default_rng(0), gs.t_max_over_hover * t_hover)
-    wp, wr, wy = gains["wp"], gains["wr"], gains["wy"]
-    Jd = np.diag(ctrl.J)
-    bw = np.array([wr, wr, wy])
-    ctrl.kp, ctrl.kv = wp ** 2, 2.0 * 0.9 * wp
-    ctrl.kR, ctrl.kW = Jd * bw ** 2, Jd * 2.0 * 0.9 * bw
-    ctrl.gains = dict(gains)
+    ctrl = MG.make_controller(cfg_true, gs, np.random.default_rng(0))
+    ctrl.set_gains(**gains)
     return ctrl
 
 
@@ -124,11 +125,13 @@ def _reference(sc, cfg_true):
     t1, t2 = MG.wall_tangents(n)
     c_off = np.asarray(cfg_true.com_offset)
     R_h = np.column_stack([sc["heading"], np.cross([0, 0, 1.0], sc["heading"]), [0, 0, 1.0]])
-    tip_off = R_h @ (np.asarray(cfg_true.rod_tip) - c_off)
+    tip_body = np.asarray(cfg_true.rod_tip) - c_off
 
+    # COM reference that puts the pad on the waypoint at the reference attitude (level for a quad)
     def p_com_ref(t):
         r, ph = ref(t)
-        return wp + r["d"] * n + r["a"] * t1 + r["b"] * t2 - tip_off, MG.push_force_vector(r, n, t1, t2), ph
+        R_d = MG.reference_attitude(R_h, r)
+        return wp + r["d"] * n + r["a"] * t1 + r["b"] * t2 - R_d @ tip_body, MG.push_force_vector(r, n, t1, t2), ph, R_d
 
     return p_com_ref, R_h
 
@@ -160,10 +163,10 @@ def _run(sc, cfg_true, gs, start_plant, step_plant):
         v = (com - com_p) / dt
         w_b = _so3_log(R_p.T @ R) / dt
         eps = 1e-3
-        p_d, F_push, ph = p_com_ref(t)
+        p_d, F_push, ph, R_d = p_com_ref(t)
         v_d = (p_com_ref(t + eps)[0] - p_com_ref(t - eps)[0]) / (2 * eps)
         a_d = (p_com_ref(t + eps)[0] - 2 * p_d + p_com_ref(t - eps)[0]) / eps ** 2
-        T_cmd = ctrl(com, v, R, w_b, p_d, v_d, a_d, F_push, sc["heading"])
+        T_cmd = ctrl(com, v, R, w_b, p_d, v_d, a_d, F_push, sc["heading"], R_d)
         u = np.clip(T_cmd * (1.0 + sc["ex"][k]), 0.0, ctrl.t_max)
         phase.append(ph)
         cmds.append(u)
@@ -187,22 +190,17 @@ def run_mujoco(sc, cfg_true, gs, model_mj=None):
     d = plant.data
     S, h = gs.substeps, gs.timestep
     M = len(cfg_true.rotor_pos)
-    t_hover = cfg_true.mass * cfg_true.gravity / M
+    t_hover = MG.hover_thrusts(cfg_true)
     n_sub = sc["T_frames"] * S
     logs = dict(thrust=np.zeros((n_sub, M)), Fa=np.zeros((n_sub, 3)), Fc=np.zeros((n_sub, 3)),
                 tc=np.zeros((n_sub, 3)), pad=np.zeros((n_sub, len(plant.pad_gids), 3)))
 
     def start(com0, R0):
-        MG.set_wall_pose(model_mj, d, sc["n"], sc["wall_point"])
-        d.qpos[0:3] = com0 - R0 @ plant.c_off
-        d.qpos[3:7] = MG._mat2quat(R0)
-        d.qvel[:] = 0.0
-        d.act[:] = t_hover
-        d.ctrl[:] = t_hover
-        mujoco.mj_forward(model_mj, d)
+        plant.set_wall(sc["n"], sc["wall_point"])
+        plant.reset(com0, R0, t_hover)
 
     def step(k, u):
-        d.ctrl[:] = u
+        plant.set_command(u)
         for j in range(S):
             i = k * S + j
             logs["thrust"][i], logs["Fa"][i], logs["Fc"][i], logs["tc"][i], logs["pad"][i] = \
@@ -213,10 +211,11 @@ def run_mujoco(sc, cfg_true, gs, model_mj=None):
     run = _run(sc, cfg_true, gs, start, step)
     T = run["n_frames"]
     # Frame 0: thrust at hover (the start state), forces copied from frame 1.
-    al = {k: MG.align_to_frames(v[:T * S], S, T, first=np.full(M, t_hover) if k == "thrust" else None)
+    al = {k: MG.align_to_frames(v[:T * S], S, T, first=t_hover if k == "thrust" else None)
           for k, v in logs.items()}
     run.update(F_contact=al["Fc"], tau_contact=al["tc"], F_pad=al["pad"], F_aero=al["Fa"],
-               rotor_speed=np.sqrt(np.maximum(al["thrust"], 0.0) / cfg_true.k_f), thrust_log=logs["thrust"][:T * S])
+               rotor_speed=np.sqrt(np.maximum(al["thrust"], 0.0) / cfg_true.k_f), rotor_thrust=al["thrust"],
+               thrust_log=logs["thrust"][:T * S])
     return run
 
 
@@ -227,7 +226,8 @@ def run_to_traj(run, sc, cfg_true, gs):
     f32 = lambda a: torch.tensor(np.asarray(a), dtype=torch.float32)
     traj = dict(pos=torch.tensor(pos, dtype=torch.float64),
                 quat=f32([MG._mat2quat(R) for R in run["R"]]),
-                rotor_speed=f32(run["rotor_speed"]), wind=f32(np.tile(sc["w_mean"], (run["n_frames"], 1))),
+                rotor_speed=f32(run["rotor_speed"]), rotor_thrust=f32(run["rotor_thrust"]),
+                wind=f32(np.tile(sc["w_mean"], (run["n_frames"], 1))),
                 phase=torch.tensor(run["phase"], dtype=torch.long),
                 F_contact=f32(run["F_contact"]), tau_contact=f32(run["tau_contact"]),
                 F_pad=f32(run["F_pad"]), F_aero=f32(run["F_aero"]),
@@ -237,7 +237,7 @@ def run_to_traj(run, sc, cfg_true, gs):
                         k_f=cfg_true.k_f, k_m=cfg_true.k_m, mu=gs.mu, k_rotor=gs.k_rotor, scenario=sc["kind"],
                         wind_mean=sc["w_mean"].tolist(), excitation=sc["excitation"],
                         wall_tilt_deg=sc["wall_tilt_deg"], yaw_offset_deg=sc["yaw_offset_deg"],
-                        control="frame_rate_fd_estimate", **sc["gains"])
+                        fully_actuated=cfg_true.fully_actuated, control="frame_rate_fd_estimate", **sc["gains"])
     return traj
 
 
@@ -249,9 +249,9 @@ def run_model(sc, cfg_true, gs, model, device="cpu", use_contact=True):
     model.eval()
     S, h, tau = gs.substeps, gs.timestep, gs.motor_tau
     M = len(cfg_true.rotor_pos)
-    t_hover = cfg_true.mass * cfg_true.gravity / M
+    t_hover = MG.hover_thrusts(cfg_true)
     w_tri = np.r_[np.arange(S), S - np.arange(S)] / S ** 2
-    st = dict(hist=[], act=np.full(M, t_hover), prev=np.full((S, M), t_hover))
+    st = dict(hist=[], act=t_hover.copy(), prev=np.tile(t_hover, (S, 1)))
     out = dict(F_contact=[], F_pad=[], F_aero=[], rotor_speed=[], c_w=[])
     f32 = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float32, device=device).unsqueeze(0)
     wall_n, wind = f32(sc["n"]), f32(sc["w_mean"])

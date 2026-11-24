@@ -9,8 +9,14 @@ pad), node types, contact mask, and hand-wired edges.
 
 Every default number below is a PLACEHOLDER. Replace mass, inertia, COM offset,
 k_f, and k_m with measured values (or read them from the MuJoCo model for sim).
+
+The defaults are the quad. fa_hexa_config() is the fully actuated hexarotor
+(AM-Bench's FAHexa with the rod + pad); PRESETS maps names to both, and the
+generator's --drone flag picks one. wrench_matrix() and hover_thrusts() work
+for any rotor layout.
 """
 
+import math
 from dataclasses import dataclass, asdict
 
 import numpy as np
@@ -72,8 +78,97 @@ class DroneConfig:
     gravity: float = 9.81
     dt: float = 0.01                # recorded step (s); checked against the data's meta
 
+    # ---- actuation ----
+    # fully_actuated: the rotors can make a force in any direction without
+    # tilting the body (tilted rotors), so the data generator flies it with a
+    # full-wrench controller and can hold any attitude. False = a quad that
+    # tilts to move (geometric controller).
+    fully_actuated: bool = False
+    rotor_thrust_max: float = None  # N per rotor; None -> GenSettings.t_max_over_hover x hover thrust
+
+    # ---- MuJoCo body (sim only: the XML builders read these; the model never does) ----
+    # MuJoCo computes mass, inertia, and COM from these geoms, and the generator
+    # writes the result back into mass / inertia / com_offset.
+    core_half_size: tuple = (0.06, 0.06, 0.025)    # m, box at core_pos
+    core_pos: tuple = (0.0, 0.0, 0.0)
+    core_mass: float = 0.9
+    arm_mass: float = 0.04          # per arm (capsule from the body origin to the hub)
+    prop_mass: float = 0.05         # per rotor (motor + prop disk at the hub)
+    prop_radius: float = 0.06       # m; the prop disks collide with the wall (crash check)
+    rod_mass: float = 0.06
+
     def to_dict(self):
         return asdict(self)
+
+
+# Fully actuated hexarotor: AM-Bench's FAHexa (hexa_scorpion.urdf, fa_hexa.py),
+# with its 4-DOF arm replaced by the rigid rod + pad.
+#   rotors   AM-Bench positions and tilts (every rotor 30 deg off vertical).
+#            AM-Bench spin dirs are +1 = CW; here +1 = CCW, so they are flipped
+#            (the yaw reaction torque comes out the same).
+#   thrust   0-23 N per rotor, k_m/k_f = 0.02 m (AM-Bench reaction-torque ratio).
+#            k_f only sets the rad/s scale: hover is ~560 rad/s (~5400 RPM, about
+#            right for the 0.152 m props).
+#   mass     AM-Bench base without the arm: 5.615 kg, split into core, arms, and
+#            motors + props. The core sits 3.7 cm up so the base COM is at the
+#            rotor-arm mount height (z = 0). AM-Bench's base inertia (0.198, 0.198,
+#            0.460) breaks the triangle inequality (Izz > Ixx + Iyy), which no real
+#            body can have and MuJoCo rejects, so the inertia comes from the geoms.
+#   rod      level, at the COM height, mounted where AM-Bench's arm is (x = 0.088).
+#            Reaches past the front prop edge by the same fraction of the drone's
+#            size as on the quad: the quad's rod tip is 0.27 m past its front prop
+#            edge (x = 0.18), 1.5x that distance, so here 1.5 x 0.494 m past
+#            x = 0.494 -> tip at x = 1.234 m. Mass scaled with length from the quad
+#            rod (same tube); the sensor and pad are the same parts.
+def fa_hexa_config():
+    pos = ((0.34175, 0.1585, -0.058), (-0.0335, 0.375, -0.058), (-0.30825, 0.2165, -0.058),
+           (-0.30825, -0.2165, -0.058), (-0.0335, -0.375, -0.058), (0.34175, -0.1585, -0.058))
+    rpy = ((-0.464, -0.252, 0.060), (0.0, 0.524, 0.0), (0.464, -0.252, -0.060),
+           (-0.464, -0.252, 0.060), (0.0, 0.524, 0.0), (0.464, -0.252, -0.060))
+    k_f = 3.5e-5
+    return DroneConfig(
+        mass=5.85, inertia=((0.15, 0.0, 0.0), (0.0, 0.20, 0.0), (0.0, 0.0, 0.32)),  # replaced by the
+        com_offset=(0.03, 0.0, 0.0),                                                # compiled MuJoCo values
+        rotor_pos=pos, rotor_axis=tuple(_rpy_z_axis(*a) for a in rpy),
+        spin_dir=(-1, 1, -1, 1, -1, 1),
+        k_f=k_f, k_m=0.02 * k_f,
+        rod_base=(0.088, 0.0, 0.0), rod_tip=(1.234, 0.0, 0.0),
+        fully_actuated=True, rotor_thrust_max=23.0,
+        core_half_size=(0.15, 0.10, 0.05), core_pos=(0.0, 0.0, 0.0368), core_mass=3.215,
+        arm_mass=0.12, prop_mass=0.28, prop_radius=0.152, rod_mass=0.20)
+
+
+# Rotor axis = body z rotated by URDF roll-pitch-yaw (R = Rz(yaw) Ry(pitch) Rx(roll)),
+# the same conversion AM-Bench's rotor_layout() does.
+def _rpy_z_axis(roll, pitch, yaw):
+    cr, sr, cp, sp, cy, sy = (math.cos(roll), math.sin(roll), math.cos(pitch), math.sin(pitch),
+                              math.cos(yaw), math.sin(yaw))
+    return (cy * sp * cr + sy * sr, sy * sp * cr - cy * sr, cp * cr)
+
+
+PRESETS = {"quad": DroneConfig, "fa_hexa": fa_hexa_config}
+
+
+# Body-frame wrench about the COM per newton of each rotor's thrust: (6, M),
+# rows [Fx, Fy, Fz, Mx, My, Mz]. Same physics as drone_dynamics.rotor_wrench_body:
+# thrust along each rotor axis, its lever arm, and the yaw reaction -spin k_m/k_f.
+def wrench_matrix(cfg):
+    r = np.asarray(cfg.rotor_pos, dtype=float) - np.asarray(cfg.com_offset, dtype=float)
+    a = np.asarray(cfg.rotor_axis, dtype=float)
+    a = a / np.linalg.norm(a, axis=1, keepdims=True)
+    s = np.asarray(cfg.spin_dir, dtype=float)
+    moment = np.cross(r, a) - (s * cfg.k_m / cfg.k_f)[:, None] * a
+    return np.vstack([a.T, moment.T])
+
+
+# Rotor thrusts (N) that hover the drone level. A quad's axes all point up, so
+# it is m g / M each; with tilted rotors the full 6-D wrench is solved.
+def hover_thrusts(cfg):
+    M = len(cfg.rotor_pos)
+    if not cfg.fully_actuated:
+        return np.full(M, cfg.mass * cfg.gravity / M)
+    target = np.array([0.0, 0.0, cfg.mass * cfg.gravity, 0.0, 0.0, 0.0])
+    return np.linalg.lstsq(wrench_matrix(cfg), target, rcond=None)[0]
 
 
 # Returns the COM-relative rotor geometry and the inertia-over-mass tensor as torch tensors.

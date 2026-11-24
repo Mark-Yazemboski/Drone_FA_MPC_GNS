@@ -14,9 +14,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from MPC.model import Drone_Dynamics
-from MPC.scenario_generator import Trajectory_Generator
-from MPC.visualize import plot_tracking, animate_flight
+from model import Drone_Dynamics
+from scenario_generator import Trajectory_Generator
+from visualize import plot_tracking, animate_flight
 
 SCRIPT_FOLDER = Path(__file__).resolve().parent
 Trained_model_path = SCRIPT_FOLDER / "MPC_Model" / "Trained_Model.pt"

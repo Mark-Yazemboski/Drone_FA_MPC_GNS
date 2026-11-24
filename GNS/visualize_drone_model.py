@@ -218,8 +218,9 @@ def _drone_polylines(cfg):
     """Body-frame polylines (relative to the COM) for a schematic drone."""
     c = np.asarray(cfg.com_offset)
     lines = []
-    hx, hy, hz = 0.06, 0.06, 0.025
+    hx, hy, hz = cfg.core_half_size
     V = np.array([[sx * hx, sy * hy, sz * hz] for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)])
+    V = V + np.asarray(cfg.core_pos)
     for a, b in [(0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3), (2, 6), (3, 7), (4, 5), (4, 6), (5, 7), (6, 7)]:
         lines.append(np.array([V[a], V[b]]))
     ang = np.linspace(0, 2 * np.pi, 25)
@@ -228,7 +229,7 @@ def _drone_polylines(cfg):
         u = np.cross(ax_, [1.0, 0, 0] if abs(ax_[0]) < 0.9 else [0, 1.0, 0])
         u /= np.linalg.norm(u)
         v = np.cross(ax_, u)
-        lines.append(p + 0.06 * (np.outer(np.cos(ang), u) + np.outer(np.sin(ang), v)))
+        lines.append(p + cfg.prop_radius * (np.outer(np.cos(ang), u) + np.outer(np.sin(ang), v)))
     base, tip = np.asarray(cfg.rod_base), np.asarray(cfg.rod_tip)
     lines.append(np.array([base, tip]))
     axis = (tip - base) / np.linalg.norm(tip - base)
@@ -304,6 +305,11 @@ def animate_closed_loop(res, cfg, path, stride=3, fps=None, friction_gain=2.5, m
         pane.set_pane_color((1, 1, 1, 0))
     pad_t = pad_center_positions(true, cfg)
     centers = 0.5 * (true["com"] + pad_t)
+    # The views are centered between the COM and the pad, and their sizes were tuned on the quad, whose
+    # outline reaches ~0.44 m from that point. A bigger drone (the hexa's rod is 1.2 m) scales them up.
+    body_reach = max(float(np.linalg.norm(P - 0.5 * tip_rest, axis=1).max()) for P in polys)
+    view_scale = max(1.0, body_reach / 0.44)
+    view_half_width = view_scale * view_half_width
     F_true_avg = _moving_average(true["F_contact"], true_force_avg_frames)
 
     # Wall patch: redrawn each frame at the pad's projection onto the wall and
@@ -331,7 +337,7 @@ def animate_closed_loop(res, cfg, path, stride=3, fps=None, friction_gain=2.5, m
         sel = near if near.any() else np.ones(T, bool)
         c_fix = centers[:T][sel].mean(0)
         ext = (centers[:T].max(0) - centers[:T].min(0)).max()
-        hw_fix = float(np.clip(0.5 * ext + 0.25, 0.40, 0.60))
+        hw_fix = view_scale * float(np.clip(0.5 * ext + 0.25, 0.40, 0.60))
         ax.set_xlim(c_fix[0] - hw_fix, c_fix[0] + hw_fix)
         ax.set_ylim(c_fix[1] - hw_fix, c_fix[1] + hw_fix)
         ax.set_zlim(c_fix[2] - hw_fix, c_fix[2] + hw_fix)

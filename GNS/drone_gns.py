@@ -4,8 +4,9 @@ GNN, and a rigid-body integrator, combined into one differentiable step.
 ONE STEP, IN ORDER
   1. Propulsion (known physics): T_j = k_f w_j^2 along each rotor axis,
      yaw reaction k_m w_j^2. k_f, k_m are learnable with a thrust-stand prior.
-  2. Aero GNN: 9 nodes (COM, 4 rotors, rod nodes, 1 pad node). Inputs are
-     body-frame local airspeeds (+ rotor speed and wall distance at rotors).
+  2. Aero GNN: COM, one node per rotor, rod nodes, 1 pad node (9 nodes for the
+     quad, 11 for the hexa). Inputs are body-frame local airspeeds (+ rotor
+     speed, wall distance, and optionally the rotor axis at rotors).
      Each node outputs a local force; torque comes from lever arms. It never
      receives contact information.
   3. Non-contact acceleration: thrust + aero + gravity turned into the
@@ -180,12 +181,12 @@ class _GNN(nn.Module):
 class AeroGNN(_GNN):
     """Outputs 4 raw numbers per node. Rotors: [in-plane drag (3, axis component
     removed), axial correction]. Other nodes: [drag (3), unused]. The last layer
-    starts at zero, so training starts from thrust + gravity only."""
+    starts at zero, so training starts from thrust + gravity only.
+    Node inputs: u (3), |u|, rotor speed, wall distance, [rotor axis (3)], type one-hot."""
 
-    N_IN = 4 + 2 + N_AERO_TYPES
-
-    def __init__(self, latent, steps, repeats, mlp_layers):
-        super().__init__(self.N_IN, 4, latent, steps, repeats, mlp_layers, 4, zero_init_out=True)
+    def __init__(self, latent, steps, repeats, mlp_layers, rotor_axis_feature=False):
+        node_in = 4 + 2 + (3 if rotor_axis_feature else 0) + N_AERO_TYPES
+        super().__init__(node_in, 4, latent, steps, repeats, mlp_layers, 4, zero_init_out=True)
 
 
 class ContactGNN(_GNN):
@@ -292,8 +293,9 @@ class DroneForceModel(nn.Module):
                                          s.k_rot_init, s.k_body_init,
                                          s.k_rod_init, s.k_pad_init,
                                          learn_thrust=s.learn_thrust_coeffs, learn_drag=s.learn_drag_coeffs)
+        self.aero_axis_feature = s.aero_rotor_axis_feature
         self.aero = AeroGNN(s.aero_latent_dim, s.aero_msg_passing_steps, s.aero_msg_passing_repeats,
-                            s.aero_mlp_layers)
+                            s.aero_mlp_layers, rotor_axis_feature=self.aero_axis_feature)
         n_static = 3 + gc["onehot"].shape[1]
         self.contact = ContactGNN(n_dyn + n_static, s.contact_latent_dim, s.contact_msg_passing_steps,
                                   s.contact_msg_passing_repeats, s.contact_mlp_layers)
@@ -338,6 +340,8 @@ class DroneForceModel(nn.Module):
         rot_feat = torch.stack([omega / self.omega_hover - 1.0,
                                 d_rot.clamp(0.0, self.aero_dist_max) / self.aero_dist_max], -1)
         rot_feat = torch.einsum('bmk,mn->bnk', rot_feat, self.rotor_sel)
+        if self.aero_axis_feature:                              # body-frame rotor axis, zero at other nodes
+            rot_feat = torch.cat([rot_feat, self.aero_node_axis.expand(B, -1, -1)], -1)
 
         x = torch.cat([self.aero_in(torch.cat([u_b, un], -1)), rot_feat,
                        self.aero_onehot.expand(B, -1, -1)], -1)

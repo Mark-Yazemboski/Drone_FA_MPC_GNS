@@ -1,0 +1,178 @@
+"""Evaluate a trained drone force model and save its figures.
+
+  1. Test set (held-out generator trajectories): validation losses for both
+     stages, k-step error out to val_horizon by regime, and learned vs. MuJoCo
+     forces (sustained contact, impacts, aero, rotor axial correction).
+  2. Closed loop (see drone_closed_loop.py): fresh scenarios flown by the same
+     controller with MuJoCo and with the model as the plant. Reports pad error,
+     contact-onset timing, and contact force error (one step and closed loop).
+  3. Figures for the first few closed-loop runs: a time-series PNG and a GIF.
+  4. Open loop (see drone_open_loop.py): the test trajectories replayed from their
+     recorded rotor speeds with no controller, from 4 start points each, with the
+     contact network on and off. Time to 1 cm / 5 cm pad error, error-growth
+     figure, one GIF per start kind.
+  5. Chatter (see diagnose_chatter.py) on the test set: step stability at sustained
+     contact, open-loop force chatter vs MuJoCo, reversal penalty size (chatter_* keys).
+
+Returns one flat dict of metrics for the run report.
+"""
+
+import os
+
+import numpy as np
+import torch
+
+from train_drone_gns import load_checkpoint, evaluate_on_dataset, _make_phys
+
+import drone_closed_loop as CL
+from drone_closed_loop import evaluate_closed_loop, gen_settings_for
+from visualize_drone_model import plot_closed_loop, animate_closed_loop
+
+
+# Friction chatter in one closed-loop run, during sustained contact (MuJoCo force
+# 0.05-10 N on two consecutive frames): RMS frame-to-frame change of the friction
+# vector (N per 10 ms step) for MuJoCo, the one-step model and the closed-loop model,
+# and the fraction of closed-loop frames whose friction exceeds mu x normal.
+def friction_jitter(r, mu):
+    true, pred, one, n = r["true"], r["pred"], r["one_step"], r["scenario"]["n"]
+    T = min(true["n_frames"], pred["n_frames"])
+    mag = np.linalg.norm(true["F_contact"][:T], axis=1)
+    sustained = (mag > 0.05) & (mag < 10.0)
+    both = sustained[1:] & sustained[:-1]
+    if not both.any():
+        return {}
+
+    def tangential(F):
+        return F - (F @ n)[:, None] * n
+
+    out = {}
+    for name, F in (("label", true["F_contact"][:T]), ("one_step", one["F_contact"][:T]),
+                    ("closed_loop", pred["F_contact"][:T])):
+        dF = np.linalg.norm(np.diff(tangential(F), axis=0), axis=1)[both]
+        out[f"ft_jitter_{name}_N"] = float(np.sqrt((dF ** 2).mean()))
+    if mu:
+        F = pred["F_contact"][:T][sustained]
+        F_n = np.maximum(F @ n, 0.0)
+        out["ft_over_cone_frac"] = float((np.linalg.norm(tangential(F), axis=1) > mu * F_n + 0.02).mean())
+    return out
+
+
+def evaluate_drone_run(model_path, test_data, meta, out_folder, n_closed_loop=6,
+                       closed_loop_kinds=("tap", "push", "slide"), closed_loop_seed=1234,
+                       n_visualize=3, make_gifs=True, gif_stride=3, sanity_check=True, device="cpu",
+                       data_wind_max=None, open_loop=True, open_loop_horizon_s=2.0, n_open_loop_gifs=4,
+                       chatter=True):
+    model, cfg, s, ck = load_checkpoint(model_path, device)
+    phys = _make_phys(cfg, s).to(device)
+    phys.load_state_dict(ck["phys"])
+    os.makedirs(out_folder, exist_ok=True)
+    metrics = {}
+
+    if test_data:
+        print(f"\ntest set: {len(test_data)} trajectories")
+        test = evaluate_on_dataset(model, phys, test_data, s, device)
+        metrics.update({f"test_{k}": v for k, v in test.items()})
+        H = s.val_horizon
+        print(f"  loss: aero {test['aero_loss']:.3e}  contact {test['contact_loss']:.3e}")
+        if "contact_loss_excl_worst_traj" in test:
+            scen = "  ".join(f"{k[13:]} {v:.3e}" for k, v in test.items()
+                             if k.startswith("contact_loss_") and k[13:] not in
+                             ("traj_median", "excl_worst_traj", "worst_traj_share", "worst_traj_id"))
+            print(f"  contact loss without the worst trajectory ({int(test['contact_loss_worst_traj_id'])}, "
+                  f"{100 * test['contact_loss_worst_traj_share']:.0f}% of the total): "
+                  f"{test['contact_loss_excl_worst_traj']:.3e} | per-trajectory median "
+                  f"{test['contact_loss_traj_median']:.3e}\n  by scenario: {scen}")
+        print(f"  pad error after {H} steps: " + "   ".join(
+            f"{r} {test[f'kstep{H}_{r}_pad_end_mm']:.3f} mm" for r in ("free", "near", "contact", "all")
+            if f"kstep{H}_{r}_pad_end_mm" in test))
+        for name in ("sustained", "impact"):
+            if f"force_{name}_err" in test:
+                print(f"  contact force, {name}: RMSE {test[f'force_{name}_err']:.3f} N "
+                      f"(label RMS {test[f'force_{name}_ref']:.3f} N)")
+        if "force_aero_err" in test:
+            print(f"  aero force: RMSE {test['force_aero_err']:.4f} N (label RMS {test['force_aero_ref']:.4f} N)")
+
+    if n_closed_loop:
+        # Closed-loop wind always matches the data: the caller passes the training
+        # data's wind; if not given, the largest per-trajectory mean wind in the test set.
+        if data_wind_max is None:
+            data_wind_max = round(max((float(d["wind"].mean(0).norm()) for d in test_data), default=0.0), 1)
+        gs = gen_settings_for(meta, wind_max=data_wind_max)
+        metrics["closed_loop_wind_max_mps"] = float(gs.wind_max)
+        print(f"\nclosed loop: {n_closed_loop} scenarios, same controller with MuJoCo and with the model as plant "
+              f"(mean wind up to {gs.wind_max:g} m/s)")
+        results, avg = evaluate_closed_loop(model, cfg, gs, n_runs=n_closed_loop, seed=closed_loop_seed,
+                                            kinds=closed_loop_kinds, device=device)
+        metrics.update({f"closed_loop_{k}": v for k, v in avg.items()})
+        for kind in sorted({r["scenario"]["kind"] for r in results}):
+            sel = [r["metrics"] for r in results if r["scenario"]["kind"] == kind]
+            for k in ("pad_err_mean_mm", "pad_err_contact_mm", "contact_onset_err_ms", "contact_onset_abs_err_ms",
+                      "contact_missed", "contact_spurious", "yaw_err_mean_deg",
+                      "fn_jitter_label_N", "fn_jitter_one_step_N", "fn_jitter_closed_loop_N",
+                      "closed_loop_sustained_contact_rmse_N", "one_step_sustained_contact_rmse_N"):
+                metrics[f"closed_loop_{kind}_{k}"] = float(np.nanmean([m.get(k, np.nan) for m in sel]))
+        mu_true = meta.get("mu") if meta else None
+        jit = [dict(kind=r["scenario"]["kind"], **friction_jitter(r, mu_true)) for r in results]
+        jit_keys = ("ft_jitter_label_N", "ft_jitter_one_step_N", "ft_jitter_closed_loop_N", "ft_over_cone_frac")
+        for kind in [None] + sorted({j["kind"] for j in jit}):
+            sel = [j for j in jit if kind is None or j["kind"] == kind]
+            tag = "closed_loop" if kind is None else f"closed_loop_{kind}"
+            for k in jit_keys:
+                vals = [j[k] for j in sel if k in j]
+                if vals:
+                    metrics[f"{tag}_{k}"] = float(np.mean(vals))
+        if "closed_loop_ft_jitter_label_N" in metrics:
+            print(f"  friction chatter (RMS change per step, sustained contact): MuJoCo "
+                  f"{metrics['closed_loop_ft_jitter_label_N']:.3f} N, one step {metrics['closed_loop_ft_jitter_one_step_N']:.3f} N, "
+                  f"closed loop {metrics['closed_loop_ft_jitter_closed_loop_N']:.3f} N"
+                  + (f" | closed-loop friction above the cone in {100 * metrics['closed_loop_ft_over_cone_frac']:.0f}% of frames"
+                     if "closed_loop_ft_over_cone_frac" in metrics else ""))
+        for i, r in enumerate(results[:n_visualize]):
+            r["mu_true"] = mu_true
+            stem = os.path.join(out_folder, f"closed_loop_{i}_{r['scenario']['kind']}")
+            plot_closed_loop(r, cfg, stem + ".png")
+            if make_gifs:
+                animate_closed_loop(r, cfg, stem + ".gif", stride=gif_stride)
+            m = r["metrics"]
+            print(f"  saved {os.path.basename(stem)} (.png, .svg" + (", .gif)" if make_gifs else ")")
+                  + f" | pad err mean {m['pad_err_mean_mm']:.1f} mm, in contact {m['pad_err_contact_mm']:.1f} mm"
+                  + f" | contact onset err {m['contact_onset_err_ms']:.0f} ms")
+        torch.save([dict(scenario=r["scenario"], metrics=r["metrics"]) for r in results],
+                   os.path.join(out_folder, "closed_loop_summary.pt"))
+
+        # Sanity check: the first push again, with the model's contact network
+        # switched off. The model drone's pad should go through the wall, which
+        # shows the closed-loop figures come from the model, not from MuJoCo.
+        if sanity_check:
+            push = next((r for r in results if r["scenario"]["kind"] == "push"), results[0])
+            sc, true = push["scenario"], push["true"]
+            off = CL.run_model(sc, cfg, gs, model, device, use_contact=False)
+            g = CL.MG.build_drone_graph(cfg)
+            pads = off["com"][:, None, :] + np.einsum('tij,nj->tni', off["R"], g["rest_nodes"].numpy()[g["pad_indices"]])
+            depth = 1e3 * float(((pads - sc["wall_point"]) @ sc["n"]).min())
+            metrics["sanity_contact_off_deepest_pad_mm"] = depth
+            # The one-step trace comes from the normal (contact-on) model, so hide its
+            # contact forces here; the aero one-step trace is unaffected and kept.
+            one_off = dict(push["one_step"])
+            one_off["F_contact"] = np.full_like(one_off["F_contact"], np.nan)
+            r_off = dict(scenario=sc, true=true, pred=off, one_step=one_off, mu_true=mu_true,
+                         metrics=CL.closed_loop_metrics(true, off, push["one_step"], sc, cfg))
+            plot_closed_loop(r_off, cfg, os.path.join(out_folder, "sanity_check_contact_off.png"),
+                             title="SANITY CHECK: same push, model with its contact network switched off "
+                                   f"(pad goes {-depth:.0f} mm into the wall)")
+            print(f"  sanity check (contact network off): model pad reaches {depth:.1f} mm "
+                  f"({'inside' if depth < 0 else 'outside'} the wall) -> saved sanity_check_contact_off.png")
+
+    if open_loop and test_data:
+        from drone_open_loop import evaluate_open_loop
+        metrics.update(evaluate_open_loop(model, cfg, test_data, out_folder, horizon_s=open_loop_horizon_s,
+                                          n_gifs=n_open_loop_gifs if make_gifs else 0, gif_stride=gif_stride,
+                                          device=device, mu_true=meta.get("mu") if meta else None))
+
+    if chatter and test_data:
+        from diagnose_chatter import chatter_metrics, print_chatter
+        print("\nchatter diagnostic (test set)")
+        m = chatter_metrics(model_path, test_data, "cuda" if torch.cuda.is_available() else device)
+        print_chatter(m)
+        metrics.update(m)
+    return metrics

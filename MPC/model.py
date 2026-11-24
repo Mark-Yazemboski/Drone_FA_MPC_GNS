@@ -1,0 +1,456 @@
+#This file will act as a wrapper for the drone dynamics model. This will act
+#as an interface between the model and the MPC controller.
+#
+#Every function works on a BATCH of states: state_vector (B, 19), rotor_speeds (B, 4).
+#That lets the MPC linearize every step of the horizon in one call (linearize_horizon),
+#instead of one step at a time. For a single state, use a batch of 1 (state.unsqueeze(0)).
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "GNS"))
+from train_drone_gns import load_checkpoint
+import torch
+import numpy as np
+from MPC.utilities import so3_log, so3_exp, quat_to_rot_matrix, rot_matrix_to_quat
+
+
+#Matrix times vector for a batch: M (B, 3, 3), v (B, 3) -> (B, 3)
+def matvec(M, v):
+    return (M @ v.unsqueeze(-1)).squeeze(-1)
+
+
+#Drone dynamics wrapper class for MPC controller.
+#This will take in a trained drone dynamics model and provide an
+#interface for the MPC controller to interact with it.
+class Drone_Dynamics:
+
+    # Initialize the drone dynamics model with the given model path.
+    #contact_cutoff_gap: if set (m), contact force is cut off for pad nodes farther than this from the wall
+    #(an extra sharp gate on top of the trained one, ~1 in contact). None = the model as trained.
+    def __init__(self, device, model_path, wall_normal_vector=None, wall_center_point=None, wind_vector=None,
+                 contact_cutoff_gap=None):
+
+        #Set up the device and load the model.
+        self.device = device
+        self.wall_normal_vector = torch.as_tensor(wall_normal_vector, dtype=torch.float32, device=self.device)
+        self.wall_center_point  = torch.as_tensor(wall_center_point,  dtype=torch.float32, device=self.device)
+        self.wind_vector = torch.as_tensor(wind_vector, dtype=torch.float32, device=self.device)
+        self.model, self.cfg, self.settings, checkpoint = load_checkpoint(model_path, self.device)
+        self.model.eval()
+        self.contact_cutoff_gap = contact_cutoff_gap
+        self.contact_cutoff_tau = 0.00015      #m, how sharply the cutoff closes (0.5 at the cutoff gap, ~0 at +1 mm)
+
+        #The network weights are fixed. Only gradients with respect to the state
+        #and the rotor speeds are needed (for the MPC Jacobians).
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+        self.dt = float(self.model.dt)
+        self.mass = float(self.model.mass)
+        self.g = torch.tensor([0.0, 0.0, -float(self.cfg.gravity)], device=self.device)
+        print("Model loaded successfully.")
+
+        #looks at the geometry of the drone to compute the pad offset and rod unit vector in the body frame.
+        self.com_location   = torch.tensor(self.cfg.com_offset, dtype=torch.float32, device=self.device)
+        self.tip_location  = torch.tensor(self.cfg.rod_tip,    dtype=torch.float32, device=self.device)
+        self.rod_base_location = torch.tensor(self.cfg.rod_base,   dtype=torch.float32, device=self.device)
+        self.rotor_locations   = torch.tensor(np.asarray(self.cfg.rotor_pos) - self.cfg.com_offset, dtype=torch.float32, device=self.device)
+        self.spin_dirs   = np.asarray(self.cfg.spin_dir, float)
+        self.motor_kf = float(self.model.params.k_f)
+        self.motor_km = float(self.model.params.k_m)        
+        self.friction_mu = float(torch.exp(checkpoint["phys"]["log_mu"]))     #learned friction coefficient
+
+        #Computes the pad offset and rod unit vector in the body frame.
+        self.pad_offset = self.tip_location - self.com_location
+        self.rod_unit   = (self.tip_location - self.rod_base_location) / (self.tip_location - self.rod_base_location).norm()
+
+        self.u_hover = self.calculate_hover_inputs()
+
+        #Body-frame inertia and its inverse (the world-frame inverse is R I^-1 R^T, so no solve is needed)
+        self.I_body = self.model.J_body * self.mass
+        self.I_body_inv = torch.linalg.inv(self.I_body)
+
+
+    def thrust_mixer(self):
+        #Rotor thrusts (4,) -> [total thrust, roll moment, pitch moment, yaw moment] about the COM, body frame
+        rotor_xs = self.rotor_locations[:, 0].cpu().numpy()
+        rotor_ys = self.rotor_locations[:, 1].cpu().numpy()
+        return np.vstack([np.ones(4), rotor_ys, -rotor_xs, -self.spin_dirs * self.motor_km / self.motor_kf])
+
+    def calculate_hover_inputs(self):
+
+        #Solves for the individual rotor thrusts required to achieve hover.
+        T = np.linalg.solve(self.thrust_mixer(), [self.mass * self.cfg.gravity, 0.0, 0.0, 0.0])
+
+        #Converts the thrusts to rotor speeds using the motor's thrust coefficient.
+        return torch.tensor(np.sqrt(T / self.motor_kf), dtype=torch.float32, device=self.device)
+
+    #---------------------------------- Calculate Forces ----------------------------------------
+
+    def get_propulsion_force(self, rotor_speeds, R_curr):
+        #Takes in the rotor speeds and the current rotation matrix to compute the propulsion force in the world frame.
+        #Uses learned k_f and k_m coefficients to compute the thrust and yaw moment generated by the rotors.
+        #(known physics: T = k_f w^2, yaw moment k_m w^2)
+
+        f_thr, tau_thr = self.model.thrust_wrench(rotor_speeds, R_curr)
+        return f_thr, tau_thr
+
+    def get_aero_force(self, com_history, R_history, rotor_speeds, wind_vector, wall_normal_vector, wall_center_point):
+        #Takes in the center of mass position and rotation matrix history,
+        #rotor speeds, wind vector, wall normal vector, and wall center point it will then use this information
+        #to generate the features for each of the nodes in the GNN's graph representation of the drone:
+        #For COM, arm, pad nodes [u, ||u||, node_type] for the rotor nodes [u, ||u||, rotor_speed, distance_to_wall, node_type]
+
+        aero = self.model.aero_forces(com_history, R_history, rotor_speeds, wind_vector, wall_normal_vector, wall_center_point)
+        return aero["F"], aero["tau"]
+
+    def get_non_contact_accel(self, F_thr_N, tau_thr_N, F_aero_N, tau_aero_N, R, angular_velocity):
+        # Acceleration the COM would have with no contact (thrust + aero + gravity), SI units, world frame.
+        #   a_nc     = (F_thr + F_aero + m*g) / m
+        #   alpha_nc = J_w^-1 (tau_thr + tau_aero - w x J_w w),   J_w = R I R^T
+        #All inputs are batched: forces (B, 3), R (B, 3, 3), angular_velocity (B, 3)
+
+        # World-frame inertia from body-frame inertia
+        J_w = R @ self.I_body @ R.transpose(-1, -2)
+
+        # Non-contact linear and angular accelerations in the world frame
+        a_nc = (F_thr_N + F_aero_N) / self.mass + self.g
+        net_torque = tau_thr_N + tau_aero_N - torch.linalg.cross(angular_velocity, matvec(J_w, angular_velocity), dim=-1)
+        alpha_nc = matvec(R, matvec(self.I_body_inv.expand_as(R), matvec(R.transpose(-1, -2), net_torque)))
+
+        return a_nc, alpha_nc
+
+    def predict_contact_force(self, state_vector, rotor_speeds):
+        #Contact force the model predicts over the next step for ONE state (no gradients):
+        #normal force (N, scalar) and friction (N, world-frame vector in the wall plane)
+        #used for plotting the models predicted force line for debugging and analysis
+        with torch.no_grad():
+            _, _, info = self.propagate_state(state_vector.unsqueeze(0), rotor_speeds.unsqueeze(0))
+        F_contact = info["F_contact"][0]
+        normal_force = F_contact @ self.wall_normal_vector
+        friction = F_contact - normal_force * self.wall_normal_vector
+        return normal_force.item(), friction.cpu().numpy()
+
+
+    def get_contact_forces(self, com_h, R_h, a_nc, alpha_nc, wall_normal_vector, wall_center_point):
+        #Takes in the COM position and rotation history, the COM's non-contact linear and angular
+        #acceleration, the wall normal vector, and the wall center point.
+        #Inside, the model spreads the COM state to the contact nodes:)
+        #node accelerations with no contact a_i = a_nc + alpha_nc x r_i + w x (w x r_i)
+        #Per-node features [vel_t, vel_t-1, a_i, a_i . n, vel_t . n, dist_to_wall, wall_normal, node type]
+        #The model will output a per-node contact force (normal + friction) and the net contact wrench about the COM.
+
+        #Normalize the non-contact linear and angular accelerations by the time step squared for the model input.
+        non_contact_accel_dt_normed = a_nc * self.dt ** 2
+        non_contact_alpha_dt_normed = alpha_nc * self.dt ** 2
+
+        #Call the model to compute contact forces based on the normalized non-contact accelerations.
+        contact = self.model.contact_forces(com_h, R_h, non_contact_accel_dt_normed, non_contact_alpha_dt_normed, wall_normal_vector, wall_center_point)
+
+        #Optional contact cutoff: scales the whole pad's contact force by a sharp gate on the CLOSEST pad
+        #node's gap to the wall (~1 in contact, 0 once that gap passes contact_cutoff_gap). It uses the closest
+        #node for the whole pad because the model spreads real contact force over pad nodes that aren't touching.
+        if self.contact_cutoff_gap is not None:
+            pad_nodes = com_h[-1].unsqueeze(1) + torch.einsum('bij,nj->bni', R_h[-1], self.model.pad_rest)    # (B, 9, 3)
+            closest_gap = ((pad_nodes - wall_center_point.unsqueeze(1)) * wall_normal_vector.unsqueeze(1)).sum(-1).min(1).values \
+                - self.cfg.pad_contact_radius                                                                  # (B,)
+            cutoff = torch.sigmoid((self.contact_cutoff_gap - closest_gap) / self.contact_cutoff_tau)
+            contact = dict(phi=contact["phi"] * cutoff[:, None, None], F=contact["F"] * cutoff[:, None],
+                           tau=contact["tau"] * cutoff[:, None], gate=contact["gate"] * cutoff[:, None, None])
+
+        #Convert the model's contact force predictions to Newtons.
+        F_nodes = self.model.to_newtons(contact["phi"])                                     # (B, N, 3)
+
+        #Split each node's force into normal and friction components.
+        n = self.wall_normal_vector
+        F_normal = (F_nodes @ n).unsqueeze(-1) * n
+        F_friction = F_nodes - F_normal
+
+        #Net contact wrench about the COM, world frame
+        F_contact = self.model.to_newtons(contact["F"])                                     # (B, 3)
+        tau_contact = self.model.to_newtons(contact["tau"])                                 # (B, 3)
+
+        #Compute the normal component of the net contact force about the COM.
+        F_Normal_total = F_contact @ n                                                      # (B,)
+
+        #Return the computed contact forces and wrenches along with the gate values, and the per-node normal and friction forces.
+        return dict(F_Normal_total=F_Normal_total, F_friction=F_friction, F_normal=F_normal,
+                    F_contact=F_contact, tau_contact=tau_contact, gate=contact["gate"][..., 0])
+
+    def rigid_body_integrator_euler(self, F_total, tau_total, state_vector, R_cur):
+        #Takes in the total force and torque acting on the rigid body, the current state vector,
+        #to compute the next state using Euler integration.
+
+        #Extracts the nessesary things from the state vector: COM position, COM velocity, and angular velocity.
+        COM_position = state_vector[:, 0:3]
+        COM_velocity = state_vector[:, 3:6]
+        Angular_velocity = state_vector[:, 10:13]
+
+        #Compute the new COM velocity and position using Euler integration.
+        new_COM_velocity = COM_velocity + (F_total / self.mass) * self.dt
+        new_COM_position = COM_position + self.dt * new_COM_velocity
+
+        #Euler's rotation equation, with the world-frame inertia J_w = R I R^T
+        #(its inverse is R I^-1 R^T, so no linear solve is needed)
+        J_w = R_cur @ self.I_body @ R_cur.transpose(-1, -2)
+        net_torque = tau_total - torch.linalg.cross(Angular_velocity, matvec(J_w, Angular_velocity), dim=-1)
+        alpha = matvec(R_cur, matvec(self.I_body_inv.expand_as(R_cur), matvec(R_cur.transpose(-1, -2), net_torque)))
+
+        #Updates the angular velocity using the computed angular acceleration.
+        new_angular_velocity = Angular_velocity + alpha * self.dt
+
+        #Compute the new rotation matrix using the updated angular velocity, and convert it to a quaternion.
+        R_new = so3_exp(new_angular_velocity * self.dt) @ R_cur
+        new_quaternion = rot_matrix_to_quat(R_new)
+
+        #Construct the new state vector by concatenating the updated COM position,
+        #COM velocity, quaternion, angular velocity, and the previous velocities.
+        new_state_vector = torch.cat([new_COM_position, new_COM_velocity, new_quaternion, new_angular_velocity,
+                                      COM_velocity, Angular_velocity], dim=-1)
+
+        return new_state_vector, R_new
+
+
+    def propagate_state(self, state_vector, rotor_speeds):
+        #Propagates a batch of drone states one model time step.
+        #state_vector (B, 19): [COM_position, COM_velocity, Quaternion, Angular_velocity, Previous_velocity, Previous_angular_velocity]
+        #rotor_speeds (B, 4)
+        #Returns the new state vectors (B, 19), the new rotation matrices (B, 3, 3), and force info.
+        B = state_vector.shape[0]
+
+        #Extract the current COM position, velocity, quaternion, angular velocity, and previous velocities from the state vector.
+        COM_position = state_vector[:, 0:3]
+        COM_velocity = state_vector[:, 3:6]
+        Quaternion = state_vector[:, 6:10]
+        Angular_velocity = state_vector[:, 10:13]
+        Previous_velocity = state_vector[:, 13:16]
+        Previous_angular_velocity = state_vector[:, 16:19]
+
+        #Compute the previous COM positions and rotation matrices based on the current and previous velocities and angular velocities.
+        COM_Pos_km1 = COM_position - COM_velocity * self.dt
+        COM_Pos_km2 = COM_Pos_km1 - Previous_velocity * self.dt
+        R_curr = quat_to_rot_matrix(Quaternion)
+        R_km1 = so3_exp(-Angular_velocity * self.dt) @ R_curr
+        R_km2 = so3_exp(-Previous_angular_velocity * self.dt) @ R_km1
+
+        #Takes the current COM position and recenters everything around it.
+        #This is needed because the model was trained on relative positions rather than absolute positions.
+        anchor = COM_position.detach()
+
+        #History in the shape the model expects, oldest -> newest:
+        #com_history (3, B, 3) and R_history (3, B, 3, 3)
+        com_history = torch.stack([COM_Pos_km2, COM_Pos_km1, COM_position]) - anchor
+        R_history = torch.stack([R_km2, R_km1, R_curr])
+
+        #Wind, wall normal, and wall center point for every sample in the batch
+        wind = self.wind_vector.expand(B, 3)
+        n = self.wall_normal_vector.expand(B, 3)
+        p_wall = self.wall_center_point - anchor
+
+
+        #------------------- CALCULATE FORCES -----------------------------
+
+        #Thrust and yaw moment from the rotors
+        f_thr, tau_thr = self.get_propulsion_force(rotor_speeds, R_curr)
+
+        #Uses the pretrained aero GNN to calculate aerodynamic forces and moments
+        f_aero, tau_aero = self.get_aero_force(com_history, R_history, rotor_speeds, wind, n, p_wall)
+
+        #Unscales the forces and moments from the model's internal units to Newtons and Newton-meters
+        F_thr_N, tau_thr_N = self.model.to_newtons(f_thr), self.model.to_newtons(tau_thr)
+        F_aero_N, tau_aero_N = self.model.to_newtons(f_aero), self.model.to_newtons(tau_aero)
+
+        #This will calculate the acceleration and angular acceleration the COM would have if there were no contact forces
+        acceleration_non_contact, Angular_acceleration_non_contact = self.get_non_contact_accel(F_thr_N, tau_thr_N, F_aero_N, tau_aero_N, R_curr, Angular_velocity)
+
+        #uses the pretrained contact GNN to calculate contact forces and moments
+        #takes in the COM history, rotation history, non-contact accelerations, wall normal, and wall center point
+        #output is a dictionary containing the contact forces and moments aswell as any additional contact information
+        #like the contact gate infromation of the nodes, and the normal and friction components of the contact forces
+        #[ "F_contact", "tau_contact", "gate", "F_normal", "F_friction" ]
+        contact = self.get_contact_forces(com_history, R_history, acceleration_non_contact, Angular_acceleration_non_contact, n, p_wall)
+
+
+        #------------------- SUM FORCES AND MOMENTS -----------------------------
+
+        #Sum all forces to get the total force acting on the drone
+        F_total = F_thr_N + F_aero_N + contact["F_contact"] + self.mass * self.g
+
+        #Sum all moments to get the total moment acting on the drone
+        tau_total = tau_thr_N + tau_aero_N + contact["tau_contact"]
+
+        #sends all of the total forces and moments to the rigid body integrator
+        new_state_vector, R_new = self.rigid_body_integrator_euler(F_total, tau_total, state_vector, R_curr)
+
+
+        #Collect contact and force information for output.
+        info = dict(F_n=contact["F_Normal_total"],          # keep the gradient
+            gate=contact["gate"].detach(),
+            F_contact=contact["F_contact"].detach(),
+            F_thrust=F_thr_N.detach(), F_aero=F_aero_N.detach())
+
+
+        return new_state_vector, R_new, info
+
+    def propagate_multi(self, state_vector, rotor_speeds, M):
+        #Runs the model M times with the same input (zero-order hold over one MPC step)
+        F_n_sum = 0
+
+        #Runs the propagation M times so the model can effectivly do one MPC step using its internal timestep
+        for _ in range(M):
+            state_vector, R, info = self.propagate_state(state_vector, rotor_speeds)
+            F_n_sum = F_n_sum + info["F_n"]
+
+        #Computes the average normal force over the M propagation steps
+        avg_normal_force = F_n_sum / M
+        return state_vector, R, dict(info, F_n=avg_normal_force)
+
+    def get_pad_values(self, state_vector):
+        #Function to compute the global positions and velocities of the drone's pads and the global direction of the rods.
+        #This is used to get values for the cost function
+
+        #Exttracts the necessary components from the state vector:
+        #center of mass position, velocity, quaternion, and angular velocity.
+        COM_position = state_vector[:, 0:3]
+        COM_velocity = state_vector[:, 3:6]
+        rotation_matrix = quat_to_rot_matrix(state_vector[:, 6:10])
+        Angular_velocity = state_vector[:, 10:13]
+
+        #Compute the global positions and velocities of the pads and the global direction of the rod.
+        pad_lever_arm = rotation_matrix @ self.pad_offset                                   # (B, 3)
+        pad_position_global = COM_position + pad_lever_arm
+        pad_velocity_global = COM_velocity + torch.linalg.cross(Angular_velocity, pad_lever_arm, dim=-1)
+        rod_unit_vector_global = rotation_matrix @ self.rod_unit
+
+        return pad_position_global, pad_velocity_global, rod_unit_vector_global
+
+    def get_wall_distances(self, state_vector):
+        p = state_vector[:, 0:3]
+        R = quat_to_rot_matrix(state_vector[:, 6:10])
+        pad_pts   = p.unsqueeze(1) + torch.einsum('bij,nj->bni', R, self.model.pad_rest)     # (B, 9, 3)  pad nodes
+        rotor_pts = p.unsqueeze(1) + torch.einsum('bij,nj->bni', R, self.model.rotor_pos)    # (B, 4, 3)  rotor hubs
+        d_pad = ((pad_pts - self.wall_center_point) @ self.wall_normal_vector).min(dim=1).values   # (B,)
+        d_rotor = (rotor_pts - self.wall_center_point) @ self.wall_normal_vector                    # (B, 4)
+        return d_pad, d_rotor
+
+    def get_tilt(self, state_vector):
+        R = quat_to_rot_matrix(state_vector[:, 6:10])
+        roll  = torch.atan2(R[:, 2, 1], R[:, 2, 2])
+        pitch = torch.asin(-R[:, 2, 0].clamp(-1, 1))
+        return roll, pitch
+
+    def outputs(self, state_vector, normal_force):
+        #Packs every output the MPC needs into one vector per sample (B, 17):
+        #[F_n(1), roll(1), pitch(1), pad_pos(3), pad_vel(3), rod_unit(3), min_pad_dist(1), rotor_dist(4)]
+        pad_position_global, pad_velocity_global, rod_unit_vector_global = self.get_pad_values(state_vector)
+        roll, pitch = self.get_tilt(state_vector)
+        pad_distance, rotor_distance = self.get_wall_distances(state_vector)
+
+        #Scalars get a trailing dimension of 1 so torch.cat can join them with the vectors
+        return torch.cat([normal_force.unsqueeze(-1), roll.unsqueeze(-1), pitch.unsqueeze(-1),
+                          pad_position_global, pad_velocity_global, rod_unit_vector_global,
+                          pad_distance.unsqueeze(-1), rotor_distance], dim=-1)
+
+
+
+    def perturb(self, x, dx):
+        #Function to perturb the state vectors (B, 19) by small deviations dx (B, 18).
+
+        #Extract the rotation matrix from the quaternion part of the state vector.
+        rotation_matrix = quat_to_rot_matrix(x[:, 6:10])
+
+        #Compute the new rotation matrix after applying the small rotation perturbation.
+        R = so3_exp(dx[:, 6:9]) @ rotation_matrix
+
+        #Return the perturbed state vector, combining position, velocity, orientation, and other state components.
+        return torch.cat([x[:, 0:3] + dx[:, 0:3], x[:, 3:6] + dx[:, 3:6], rot_matrix_to_quat(R),
+                          x[:, 10:13] + dx[:, 9:12], x[:, 13:16] + dx[:, 12:15], x[:, 16:19] + dx[:, 15:18]], dim=-1)
+
+    def state_error(self, x, x_nom, R, R_nom):
+        #Function to compute the state error, including orientation error represented as a rotation vector.
+        #The reason why we cant just subtract quaternions to get orientation error is that quaternions represent
+        #rotations in a non-linear space. Instead, we use the rotation matrix and the logarithm map to get a rotation
+        #vector representing the orientation error.
+
+        # Orientation error
+        dth = so3_log(R @ R_nom.transpose(-1, -2))
+
+        # Concatenate all state errors into a single vector per sample (B, 18).
+        return torch.cat([x[:, 0:3] - x_nom[:, 0:3], x[:, 3:6] - x_nom[:, 3:6], dth,
+                          x[:, 10:13] - x_nom[:, 10:13], x[:, 13:16] - x_nom[:, 13:16], x[:, 16:19] - x_nom[:, 16:19]], dim=-1)
+
+
+    def rollout(self, state_vector, input_sequence, MPC_dt_multiple):
+        #Nominal trajectory over the horizon (no gradients). This part is sequential, since each
+        #state depends on the one before it, but it's cheap (one forward pass per step).
+        #state_vector (19,), input_sequence (N, 4) -> nominal states (N + 1, 19), starting with state_vector
+        with torch.no_grad():
+            nominal_states = [state_vector]
+            for rotor_speeds in input_sequence:
+                next_state, _, _ = self.propagate_multi(nominal_states[-1].unsqueeze(0), rotor_speeds.unsqueeze(0), MPC_dt_multiple)
+                nominal_states.append(next_state[0])
+        return torch.stack(nominal_states)
+
+
+    def linearize_horizon(self, nominal_states, input_sequence, MPC_dt_multiple):
+        #Linearizes the dynamics about EVERY step of the horizon at once.
+        #nominal_states (N, 19), input_sequence (N, 4): the nominal state and input at each step
+        #Returns A (N, 18, 18), B (N, 18, 4), C (N, 17, 18), D (N, 17, 4),
+        #the nominal next states (N, 19), and the nominal outputs (N, 17).
+        N = nominal_states.shape[0]
+
+        #Calculates the nominal next states and nominal outputs without any perturbations.
+        with torch.no_grad():
+            x_next_nom, R_next_nom, info_nom = self.propagate_multi(nominal_states, input_sequence, MPC_dt_multiple)
+            nominal_output = self.outputs(nominal_states, info_nom["F_n"])
+
+        def g(dx, du):
+            #Deviation of the next state and the outputs from their nominal values,
+            #given small perturbations in the current state and input, for every horizon step.
+
+            #Perturb the state and input based on the provided deviations.
+            perturbed_state = self.perturb(nominal_states, dx)
+            perturbed_input = input_sequence + du
+
+            #Propagate the perturbed state and input through the system dynamics.
+            x_next, R_next, info = self.propagate_multi(perturbed_state, perturbed_input, MPC_dt_multiple)
+
+            state_diff = self.state_error(x_next, x_next_nom, R_next, R_next_nom)
+            output_diff = self.outputs(perturbed_state, info["F_n"]) - nominal_output
+
+            #Each horizon step only depends on its own perturbation, so summing over the steps
+            #keeps every step's derivatives separate: d(sum)/d(dx_k) = d(g_k)/d(dx_k).
+            #One Jacobian of the sum then gives the Jacobians of all N steps at once.
+            return torch.cat([state_diff, output_diff], dim=-1).sum(0)
+
+        #Compute the Jacobians of the function g with respect to the state and input deviations.
+        #Jx: (35, N, 18), Ju: (35, N, 4) -> reordered so the horizon step comes first
+        zeros_dx = torch.zeros(N, 18, device=self.device)
+        zeros_du = torch.zeros(N, 4, device=self.device)
+        Jx, Ju = torch.autograd.functional.jacobian(g, (zeros_dx, zeros_du), vectorize=True)
+        Jx = Jx.permute(1, 0, 2)
+        Ju = Ju.permute(1, 0, 2)
+
+        #Convert the Jacobians into the standard state space form.
+        A, B, C, D = Jx[:, :18], Ju[:, :18], Jx[:, 18:], Ju[:, 18:]
+
+        #Return state space matrices, nominal next states, and nominal outputs.
+        return A, B, C, D, x_next_nom, nominal_output
+
+    def linearize(self, state_vector, rotor_speeds, MPC_dt_multiple):
+        #Linearizes about ONE state and input (a horizon of 1). Kept for scripts that do it step by step.
+        A, B, C, D, x_next_nom, nominal_output = self.linearize_horizon(state_vector.unsqueeze(0), rotor_speeds.unsqueeze(0), MPC_dt_multiple)
+        return A[0], B[0], C[0], D[0], x_next_nom[0], nominal_output[0]
+
+    def linearize_outputs(self, state_vector):
+        #Output rows only (no dynamics), for the final state of the horizon. No GNN involved.
+        #state_vector (19,) -> C (17, 18), nominal output (17,)
+        state_batch = state_vector.unsqueeze(0)
+        no_force = torch.zeros(1, device=self.device)
+        with torch.no_grad():
+            nominal_output = self.outputs(state_batch, no_force)
+
+        def h(dx):
+            return (self.outputs(self.perturb(state_batch, dx.unsqueeze(0)), no_force) - nominal_output)[0]
+
+        C = torch.autograd.functional.jacobian(h, torch.zeros(18, device=self.device), vectorize=True)
+        return C, nominal_output[0]

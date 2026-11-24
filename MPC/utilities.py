@@ -1,0 +1,116 @@
+import time
+import torch
+import numpy as np
+import mujoco
+
+# Logarithm map for SO(3): rotation matrix -> rotation vector
+def so3_log(R):
+    tr = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
+    cos_theta = ((tr - 1.0) * 0.5).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+    theta = torch.acos(cos_theta).unsqueeze(-1)                  # (..., 1)
+    vee = torch.stack([
+        R[..., 2, 1] - R[..., 1, 2],
+        R[..., 0, 2] - R[..., 2, 0],
+        R[..., 1, 0] - R[..., 0, 1],
+    ], dim=-1) * 0.5
+    small = theta < 1e-4
+    sin_safe = torch.sin(theta).clamp_min(1e-12)
+    factor = torch.where(small, 1.0 + theta ** 2 / 6.0, theta / sin_safe)
+    return factor * vee
+
+
+# Exponential map for SO(3): rotation vector -> rotation matrix (Rodrigues' formula)
+def so3_exp(w):
+    theta = w.norm(dim=-1, keepdim=True).unsqueeze(-1)          # (..., 1, 1)
+    K = torch.zeros(w.shape[:-1] + (3, 3), dtype=w.dtype, device=w.device)
+    K[..., 0, 1], K[..., 0, 2], K[..., 1, 2] = -w[..., 2], w[..., 1], -w[..., 0]
+    K[..., 1, 0], K[..., 2, 0], K[..., 2, 1] = w[..., 2], -w[..., 1], w[..., 0]
+    small = theta < 1e-4
+    theta_safe = theta.clamp_min(1e-12)
+    A = torch.where(small, 1.0 - theta ** 2 / 6.0, torch.sin(theta_safe) / theta_safe)
+    B = torch.where(small, 0.5 - theta ** 2 / 24.0, (1.0 - torch.cos(theta_safe)) / theta_safe ** 2)
+    eye = torch.eye(3, device=w.device, dtype=w.dtype).expand(K.shape)
+    return eye + A * K + B * (K @ K)
+
+def quat_to_rot_matrix(q):
+    # q: (..., 4) quaternion, scalar first [w, x, y, z] (MuJoCo's convention). Normalized here.
+    q = q / q.norm(dim=-1, keepdim=True)
+    w, x, y, z = q.unbind(-1)
+    return torch.stack([
+        1 - 2 * (y * y + z * z),     2 * (x * y - w * z),     2 * (x * z + w * y),
+            2 * (x * y + w * z), 1 - 2 * (x * x + z * z),     2 * (y * z - w * x),
+            2 * (x * z - w * y),     2 * (y * z + w * x), 1 - 2 * (x * x + y * y),
+    ], dim=-1).reshape(q.shape[:-1] + (3, 3))
+
+def quat_error_map(q_nom):
+    w, u = q_nom[0], q_nom[1:4]
+    u_cross = np.array([[0, -u[2], u[1]], [u[2], 0, -u[0]], [-u[1], u[0], 0]])
+    return 0.5 * np.vstack([-u[None, :], w * np.eye(3) - u_cross])
+
+
+def rot_matrix_to_quat(R):
+    # R: (..., 3, 3) -> (..., 4) [w, x, y, z]. Branch-free Shepperd-style: uses the largest
+    # of the four candidate denominators, so it's stable at every attitude.
+    m00, m11, m22 = R[..., 0, 0], R[..., 1, 1], R[..., 2, 2]
+    t = torch.stack([1 + m00 + m11 + m22, 1 + m00 - m11 - m22,
+                     1 - m00 + m11 - m22, 1 - m00 - m11 + m22], -1)
+    i = t.argmax(-1, keepdim=True)
+    s = 2 * torch.sqrt(t.gather(-1, i).clamp_min(1e-12)).squeeze(-1)
+    q = torch.stack([
+        torch.stack([s / 4, (R[..., 2, 1] - R[..., 1, 2]) / s, (R[..., 0, 2] - R[..., 2, 0]) / s, (R[..., 1, 0] - R[..., 0, 1]) / s], -1),
+        torch.stack([(R[..., 2, 1] - R[..., 1, 2]) / s, s / 4, (R[..., 0, 1] + R[..., 1, 0]) / s, (R[..., 0, 2] + R[..., 2, 0]) / s], -1),
+        torch.stack([(R[..., 0, 2] - R[..., 2, 0]) / s, (R[..., 0, 1] + R[..., 1, 0]) / s, s / 4, (R[..., 1, 2] + R[..., 2, 1]) / s], -1),
+        torch.stack([(R[..., 1, 0] - R[..., 0, 1]) / s, (R[..., 0, 2] + R[..., 2, 0]) / s, (R[..., 1, 2] + R[..., 2, 1]) / s, s / 4], -1),
+    ], -2)
+    q = q.gather(-2, i.unsqueeze(-1).expand(*i.shape[:-1], 1, 4)).squeeze(-2)
+    return q / q.norm(dim=-1, keepdim=True)
+
+
+def orthonormalize(R):
+    U, _, Vt = np.linalg.svd(R)
+    return U @ np.diag([1.0, 1.0, np.linalg.det(U @ Vt)]) @ Vt
+
+def vec_to_str(x):
+    #Formats a vector for the MuJoCo XML
+    return " ".join(f"{float(a):.6g}" for a in x)
+
+
+def quat_to_rot_matrix_np(q):
+    #[w, x, y, z] quaternion -> rotation matrix
+    R = np.zeros(9)
+    mujoco.mju_quat2Mat(R, np.asarray(q, dtype=float))
+    return R.reshape(3, 3)
+
+
+def rot_matrix_to_quat_np(R):
+    #Rotation matrix -> [w, x, y, z] quaternion
+    q = np.zeros(4)
+    mujoco.mju_mat2Quat(q, np.asarray(R, dtype=float).reshape(-1))
+    return q
+
+
+def so3_log_np(R):
+    #Rotation matrix -> rotation vector (used for the finite-difference angular velocity)
+    cos_theta = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)
+    theta = np.arccos(cos_theta)
+    vee = 0.5 * np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+    if theta < 1e-6:
+        return vee
+    return theta / np.sin(theta) * vee
+
+#Converts a torch tensor or numpy array to a numpy array, ensuring compatibility with Gurobi and other numpy-based operations
+def to_np(v):
+    return v.detach().cpu().numpy() if torch.is_tensor(v) else np.asarray(v)
+
+#Calculates the contact gate using a sigmoid function based on the pad distance, reference distance, and a smoothing factor tau
+def calculate_contact_gate(pad_dist, d0, tau):
+    return torch.sigmoid(torch.tensor((d0 - pad_dist) / tau)).item()
+
+#Current time, for timing sections of code. GPU calls return before the GPU has finished,
+#so when a CUDA device is given it waits for the GPU first; otherwise the GPU time would
+#show up in whatever runs next. With no device (CPU-only code like the QP), it just reads the clock.
+def timer(device=None):
+    if device is not None and device.type == "cuda":
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
